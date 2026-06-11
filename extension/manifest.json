@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Code Browser Bridge",
+  "version": "1.0.0",
+  "description": "Connect your live, logged-in Chrome tabs to Claude Code for AI-assisted debugging, testing, and browser automation. 28 tools including DOM snapshots, console/network monitoring, screenshots, and more.",
+  "permissions": ["activeTab", "scripting", "tabs", "tabGroups", "alarms", "storage", "cookies"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "homepage_url": "https://github.com/HimanshuKanwar2001/claude-browser-bridge"
+}

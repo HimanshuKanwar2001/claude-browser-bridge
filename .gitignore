@@ -1,0 +1,9 @@
+node_modules/
+server/.bridge-token
+extension/config.js
+dist/
+*.zip
+*.log
+resume/
+extension/icons/*.svg
+extension/icons/generate-icons.html
