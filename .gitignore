@@ -7,3 +7,4 @@ dist/
 resume/
 extension/icons/*.svg
 extension/icons/generate-icons.html
+.DS_Store

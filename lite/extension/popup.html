@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { width: 260px; font-family: -apple-system, sans-serif; padding: 14px; background: #fafafa; }
+  .header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .logo { width: 28px; height: 28px; border-radius: 6px; }
+  .title { font-size: 13px; font-weight: 600; color: #1a1a1a; }
+  .subtitle { font-size: 10px; color: #999; }
+  .status { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 6px; }
+  .status.on { background: #e8f5e9; }
+  .status.off { background: #ffeaea; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .dot.on { background: #2e7d32; }
+  .dot.off { background: #c62828; }
+  .text { font-size: 11px; color: #333; }
+  .footer { margin-top: 8px; font-size: 9px; color: #ccc; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <img class="logo" src="icons/icon32.png" alt="">
+    <div>
+      <div class="title">Browser Bridge Lite</div>
+      <div class="subtitle">Basic browser automation</div>
+    </div>
+  </div>
+  <div id="box" class="status off">
+    <div id="dot" class="dot off"></div>
+    <span id="txt" class="text">Checking...</span>
+  </div>
+  <div class="footer">v1.0.0 Lite Edition</div>
+  <script>
+    chrome.runtime.sendMessage({ type: "status" }, (res) => {
+      document.getElementById("dot").className = "dot " + (res?.connected ? "on" : "off");
+      document.getElementById("txt").textContent = res?.connected ? "Connected" : "Not connected";
+      document.getElementById("box").className = "status " + (res?.connected ? "on" : "off");
+    });
+  </script>
+</body>
+</html>

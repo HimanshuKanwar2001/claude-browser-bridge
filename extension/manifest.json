@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Claude Code Browser Bridge",
   "version": "1.0.0",
-  "description": "Connect your live, logged-in Chrome tabs to Claude Code for AI-assisted debugging, testing, and browser automation. 28 tools including DOM snapshots, console/network monitoring, screenshots, and more.",
-  "permissions": ["activeTab", "scripting", "tabs", "tabGroups", "alarms", "storage", "cookies"],
+  "description": "Connect your live Chrome tabs to Claude Code — 40 tools: debugging, performance, accessibility, device emulation.",
+  "permissions": ["activeTab", "scripting", "tabs", "tabGroups", "alarms", "storage", "cookies", "debugger"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
