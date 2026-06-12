@@ -289,8 +289,9 @@ Bug Investigation:
 Performance Audit:
   batch([performance_trace, get_load_timeline, heap_snapshot_summary])
 
-Page Interaction:
-  diagnose → fill({ref:"ref_3", value:"..."}) → click({ref:"ref_0"}) → wait_for({text:"Success"})
+Page Interaction (with observe mode — Claude sees every action's result automatically):
+  observe_mode({enabled:true}) → diagnose → fill({ref:"ref_3"}) → click({ref:"ref_0"})
+  Every interaction returns a screenshot — no separate screenshot calls needed.
 
 Multi-tab Research:
   select_tab(app) → new_tab(docs) → get_page_text → close_tab → continue on app
@@ -351,6 +352,19 @@ const BATCH_TOOL = {
       },
     },
     required: ["calls"],
+  },
+};
+
+const OBSERVE_TOOL = {
+  name: "observe_mode",
+  description:
+    "Toggle observe mode ON/OFF. When ON, every interaction tool (click, fill, hover, scroll, navigate) automatically captures and returns a screenshot in its response — Claude sees the visual result of every action without separate screenshot calls. Turn ON at session start for visual debugging workflows. Turn OFF for speed when you don't need visual feedback.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      enabled: { type: "boolean", description: "true to enable, false to disable" },
+    },
+    required: ["enabled"],
   },
 };
 
@@ -1007,7 +1021,7 @@ const server = new Server(
   { capabilities: { tools: {} } }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [HELP_TOOL, BATCH_TOOL, ...TOOLS] }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [HELP_TOOL, OBSERVE_TOOL, BATCH_TOOL, ...TOOLS] }));
 
 function formatResult(name, result) {
   if ((name === "screenshot" || name === "full_page_screenshot") && result?.dataUrl) {
@@ -1045,6 +1059,17 @@ function formatResult(name, result) {
       content: [
         { type: "text", text: `Diff: ${result.diffPercent}% changed (${result.diffPixels} pixels)` },
         { type: "image", data: diffBase64, mimeType: "image/png" },
+      ],
+    };
+  }
+  // Observe mode: if the response includes an auto-captured screenshot, return it as an image
+  if (result?.__screenshot) {
+    const base64 = result.__screenshot.replace(/^data:image\/png;base64,/, "");
+    const { __screenshot, ...rest } = result;
+    return {
+      content: [
+        { type: "text", text: JSON.stringify(rest, null, 2) },
+        { type: "image", data: base64, mimeType: "image/png" },
       ],
     };
   }

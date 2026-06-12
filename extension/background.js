@@ -89,8 +89,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 let targetTabId = null;
 let markedTabId = null;
 let markerGrouped = false;
-const injectedTabs = new Set(); // tracks tabs with inject.js already present
-const debuggerTabs = new Set(); // F3 FIX: tracks tabs with debugger attached
+let observeMode = false; // when true, interaction tools auto-capture screenshot in response
+const injectedTabs = new Set();
+const debuggerTabs = new Set();
 
 // F3 FIX: safe debugger attach/detach that tracks state
 async function safeDebuggerAttach(tabId) {
@@ -235,9 +236,29 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   injectedTabs.delete(tabId);
+  debuggerTabs.delete(tabId);
   if (tabId === markedTabId) { markedTabId = null; markerGrouped = false; }
   if (tabId === targetTabId) { targetTabId = null; chrome.storage.session.remove("targetTabId"); }
 });
+
+// Auto-observe: capture screenshot after interaction tools and attach to response
+async function autoCapture(tabId) {
+  if (!observeMode) return null;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab.active) { await chrome.tabs.update(tabId, { active: true }); await new Promise(r => setTimeout(r, 150)); }
+    if (markedTabId === tabId) await applyMarker(tabId, false);
+    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png", quality: 70 });
+    if (markedTabId === tabId) applyMarker(tabId, true);
+    return dataUrl;
+  } catch { return null; }
+}
+
+function attachScreenshot(result, dataUrl) {
+  if (!dataUrl) return result;
+  result.__screenshot = dataUrl;
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // Script execution helpers
@@ -434,7 +455,8 @@ async function actOnElement(tab, params, action) {
     "MAIN"
   );
   if (result?.error) throw new Error(result.error);
-  return { [action === "click" ? "clicked" : "filled"]: params.selector || `ref_${ref}`, waitedMs: result.waitedMs };
+  const response = { [action === "click" ? "clicked" : "filled"]: params.selector || `ref_${ref}`, waitedMs: result.waitedMs };
+  return attachScreenshot(response, await autoCapture(tab.id));
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +475,14 @@ async function handle(msg) {
       title: t.title,
       url: t.url,
     }));
+  }
+
+  if (msg.method === "observe_mode") {
+    observeMode = Boolean(params.enabled);
+    return { observe_mode: observeMode, note: observeMode
+      ? "Observe mode ON — click, fill, hover, scroll, navigate will auto-capture screenshots in their response. Claude sees the result of every action without separate screenshot calls."
+      : "Observe mode OFF — interactions return data only, call screenshot separately."
+    };
   }
 
   if (msg.method === "select_tab" && params.clear) {
@@ -594,6 +624,10 @@ async function handle(msg) {
     case "navigate": {
       injectedTabs.delete(tab.id);
       await chrome.tabs.update(tab.id, { url: params.url });
+      if (observeMode) {
+        await new Promise(r => setTimeout(r, 2000));
+        return attachScreenshot({ tab_id: tab.id, navigating_to: params.url }, await autoCapture(tab.id));
+      }
       return { tab_id: tab.id, navigating_to: params.url };
     }
 
@@ -615,7 +649,7 @@ async function handle(msg) {
         "MAIN"
       );
       if (result?.error) throw new Error(result.error);
-      return { hovered: params.selector || `ref_${ref}` };
+      return attachScreenshot({ hovered: params.selector || `ref_${ref}` }, await autoCapture(tab.id));
     }
 
     case "select_option": {
