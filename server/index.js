@@ -211,10 +211,48 @@ establish();
 
 // --- MCP server exposed to Claude Code -------------------------------------
 
+const HELP_TOOL = {
+  name: "browser_bridge_help",
+  description:
+    "Returns the complete usage guide for all 57 browser-bridge tools. Call this ONCE at the start of any session where you need to use browser tools, to learn the optimal workflows and avoid slow anti-patterns.",
+  inputSchema: { type: "object", properties: {} },
+};
+
+const HELP_TEXT = `# Claude Browser Bridge — 57 Tools Usage Guide
+
+## CRITICAL RULES (read before using ANY tool):
+1. ALWAYS start with \`diagnose\` — it returns snapshot + console errors + network failures + API responses in ONE call. NEVER call snapshot, get_console, get_network separately.
+2. Use \`batch\` for 2+ independent calls — e.g. batch([{name:"get_cookies"}, {name:"get_storage"}]).
+3. Pin with \`select_tab\` once, then stop passing tab_id — the pin persists.
+4. Use \`new_tab\` for research — NEVER navigate away from the app tab.
+5. After EVERY CSS/UI code change, take a \`screenshot\` to verify. Never claim "this should work" without seeing it.
+6. Use \`inject_css\` to test CSS fixes instantly without rebuilding, then write to file once confirmed.
+7. After 3 failed fix attempts, search the web: new_tab({url:"https://google.com/search?q=..."}).
+
+## Tool Categories:
+- Core: diagnose, batch, select_tab, snapshot, eval, screenshot, full_page_screenshot, get_page_text, get_html, get_page_info
+- Interaction: click, fill, hover, scroll, press_key, select_option, upload_file, highlight_element
+- Navigation: navigate, new_tab, close_tab, go_back, go_forward, reload, list_tabs, wait_for
+- Debugging: get_console, get_grouped_console, get_network, search_network_bodies, get_styles, get_cookies, get_storage, get_clipboard, watch_dom_changes, generate_selector
+- Performance: performance_trace, heap_snapshot_summary, get_load_timeline
+- Accessibility: get_accessibility_tree, check_contrast
+- Emulation: emulate_device, network_throttle, set_geolocation, toggle_dark_mode
+- Testing: visual_diff, inject_css, mock_network, record_actions, replay_actions, handle_dialog
+- Productivity: save_form_profile, load_form_profile, save_tab_session, restore_tab_session, edit_cookie, export_pdf
+
+## Key Workflows:
+- Investigate a page: diagnose → read errors → fix → screenshot to verify
+- Visual bug fix: batch([screenshot, get_styles]) → edit code → screenshot → compare → iterate
+- Performance audit: batch([performance_trace, heap_snapshot_summary, get_load_timeline])
+- Accessibility check: batch([get_accessibility_tree, check_contrast])
+- Test error states: mock_network({url_pattern:"/api/x", status_code:500}) → reload → screenshot
+- Record regression test: record_actions → reproduce bug → stop → fix → replay_actions to verify
+`;
+
 const BATCH_TOOL = {
   name: "batch",
   description:
-    "Execute multiple tool calls in a single round-trip for speed. Pass an array of {name, arguments} objects. All calls run in parallel and results are returned in the same order. Use this when you need to call 2+ tools that don't depend on each other.",
+    "Execute multiple tool calls in a single round-trip for speed. Pass an array of {name, arguments} objects. All calls run in parallel and results are returned in the same order. Use this when you need to call 2+ tools that don't depend on each other. ALWAYS prefer this over sequential calls.",
   inputSchema: {
     type: "object",
     properties: {
@@ -502,7 +540,7 @@ const TOOLS = [
   {
     name: "diagnose",
     description:
-      "PREFERRED first tool — returns snapshot + console errors + failed network requests + recent API responses + CAPTCHA/iframe detection + localStorage keys, ALL in a single call. Use this instead of calling snapshot + get_console + get_network separately. Replaces 4 round-trips with 1.",
+      "⚡ CALL THIS FIRST on any page. Returns snapshot (interactive elements with refs for click/fill) + console errors with stacks + failed network requests with response bodies + recent successful API responses + CAPTCHA detection + cross-origin iframe warnings + localStorage keys — ALL in ONE call. Replaces 4-5 sequential tool calls. After this, use refs from the snapshot to click/fill elements.",
     inputSchema: {
       type: "object",
       properties: {
@@ -809,7 +847,7 @@ const server = new Server(
   { capabilities: { tools: {} } }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [BATCH_TOOL, ...TOOLS] }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [HELP_TOOL, BATCH_TOOL, ...TOOLS] }));
 
 function formatResult(name, result) {
   if ((name === "screenshot" || name === "full_page_screenshot") && result?.dataUrl) {
@@ -837,6 +875,11 @@ function formatResult(name, result) {
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   try {
+    // Help: return the full usage guide (no extension needed).
+    if (name === "browser_bridge_help") {
+      return { content: [{ type: "text", text: HELP_TEXT }] };
+    }
+
     // Batch: run multiple calls in one round-trip through the extension.
     if (name === "batch") {
       const calls = args?.calls;
