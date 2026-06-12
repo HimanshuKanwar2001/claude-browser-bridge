@@ -1,147 +1,226 @@
-# Claude Code Browser Bridge
+# Global Instructions
 
-## Performance Rules (MUST follow)
+## Browser Bridge (browser-bridge MCP — 58 tools)
 
-1. **Start with `diagnose`** — returns snapshot + errors + network + API responses in ONE call. Never call `snapshot`, `get_console`, `get_network` separately when investigating a page.
-2. **Use `batch`** for independent calls — e.g. `batch([{name:"get_cookies"}, {name:"get_storage"}])` instead of two sequential calls.
-3. **Pin with `select_tab` once**, then stop passing `tab_id` — the pin persists across all calls.
-4. **Use `get_page_info`** for quick checks (just errors + failed requests, no snapshot).
-5. **Use `new_tab` for research** — never navigate away from the app tab.
-6. **Use `eval` for state inspection** — reading React/Redux state, checking variables. Faster than DOM scraping.
+The `browser-bridge` MCP connects to the user's real Chrome browser via an extension. ALL browser operations MUST use these tools — never use WebFetch, curl, or other workarounds.
 
-## Anti-patterns (NEVER do these)
-
-- Calling `snapshot` then `get_console` then `get_network` then `screenshot` sequentially — use `diagnose` or `batch`
-- Calling `list_tabs` before every action — the pinned tab persists
-- Using `navigate` on the app tab to open docs — use `new_tab`
-- Calling `get_page_text` to read the whole page when you need specific data — use `eval`
-- Calling `get_page_text` on the whole page when you need specific data — use `eval`
-
-## Parallel Investigation (MUST follow when debugging)
-
-When investigating ANY bug, gather all context in ONE parallel batch — not sequential calls:
+### Decision Tree: Which tool first?
 
 ```
-batch([
-  {name: "diagnose"},
-  {name: "eval", arguments: {code: "<read app state>"}},
-  {name: "get_styles", arguments: {selector: "<problem element>"}},
-])
+Is this about a web page?
+├── Investigating a bug/issue → diagnose (ONE call gives you everything)
+├── Fixing CSS/visual → batch([screenshot, get_styles, get_html])
+├── Checking performance → batch([performance_trace, get_load_timeline])
+├── Checking accessibility → batch([get_accessibility_tree, check_contrast])
+├── Reading page content → eval (for specific data) or get_page_text (for all text)
+├── Interacting with the page → diagnose first (get refs), then click/fill/hover using refs
+├── Opening a URL for research → new_tab (NEVER navigate away from the app tab)
+└── Don't know yet → diagnose (it covers 80% of what you need)
 ```
 
-For multi-page/multi-tab investigations, open tabs and read them in parallel:
+### Critical Rules (break these = slow, bad results)
+
+1. **`diagnose` FIRST, always.** Returns snapshot (refs for click/fill) + console errors + failed network + API responses + CAPTCHA detection in ONE call. Never call snapshot, get_console, get_network separately.
+2. **`batch` for parallel calls.** If you're about to make 2+ calls that don't depend on each other, ALWAYS batch them. Every sequential call wastes 2-3 seconds.
+3. **`select_tab` once, never again.** Pin the target tab at session start. Stop passing tab_id after that.
+4. **`new_tab` for research.** NEVER use navigate on the app tab to open docs/Stack Overflow. Open → read → close_tab.
+5. **`screenshot` after EVERY code edit.** Never claim a visual fix works without seeing it. Period.
+6. **`inject_css` before editing files.** Test CSS changes instantly in the live page, confirm with screenshot, THEN write to the actual file.
+7. **`eval` for state.** Reading React state, Redux store, variables, or specific DOM values is faster than parsing full page text.
+8. **`get_styles` for CSS.** Never guess computed values — Less variables, calc(), tokens all resolve unpredictably. Read the actual computed styles.
+9. **3 failed attempts = search the web.** Open `new_tab` with Google search, read solutions, close tab. Stop guessing.
+10. **Update `bug-playbook.md`** after every fix — the next similar bug gets solved instantly.
+
+### Workflow: Visual/CSS Bug Fix
+
 ```
-batch([
-  {name: "new_tab", arguments: {url: "page1"}},
-  {name: "new_tab", arguments: {url: "page2"}},
-])
-// then:
-batch([
-  {name: "get_page_text", arguments: {tab_id: TAB1}},
-  {name: "get_page_text", arguments: {tab_id: TAB2}},
-])
+1. batch([screenshot, get_styles({selector:".problem"}), get_html({selector:".problem"})])
+   → See the current state + actual CSS values + actual DOM structure
+
+2. inject_css({css: ".problem { padding: 16px; }"})
+   → Test the fix instantly, no rebuild needed
+
+3. screenshot
+   → Verify it looks right
+
+4. If wrong: get_styles again → find what CSS actually applied → adjust → screenshot
+
+5. If right: write the change to the actual source file, remove inject_css
+
+6. screenshot one more time to confirm the file-based change took effect (after HMR/rebuild)
 ```
 
-Rule: if you're about to make 2+ tool calls that don't depend on each other's results, ALWAYS batch them. Every sequential call wastes 2-3 seconds of model latency.
+### Workflow: Bug Investigation
 
-## Bug Playbook — Learn from Past Fixes
-
-**BEFORE investigating any bug**, read `bug-playbook.md` in this repo. It contains patterns from past debugging sessions — symptoms, root causes, and fixes. If the current bug matches a known pattern, apply the fix directly instead of re-investigating from scratch.
-
-**AFTER fixing any bug**, append a new entry to `bug-playbook.md` with:
 ```
-## Pattern: <short name>
-**Symptoms:** <what the user sees / what console/network shows>
-**Root cause:** <what was actually wrong>
-**How we found it:** <which tools revealed it>
-**Fix:** <what we changed>
+1. Read bug-playbook.md (if exists) — check for matching patterns
+
+2. diagnose → read errors, failed requests, API responses
+
+3. If need more: batch([get_grouped_console, get_network({url_contains:"/api/"}), eval({code:"..."})])
+
+4. If stuck after 3 attempts: new_tab Google search → read solutions → close_tab
+
+5. Fix → screenshot to verify → append pattern to bug-playbook.md
 ```
 
-This playbook grows over time. A bug you fix today saves 10 minutes next time a similar bug appears.
+### Workflow: Performance Audit
 
-## Self-Research When Stuck
+```
+batch([performance_trace, get_load_timeline, heap_snapshot_summary])
+→ Web Vitals (LCP/FCP/CLS) + full resource waterfall + memory usage in ONE call
+```
 
-When you can't figure out a bug after 2 attempts, **search the web through the bridge** instead of guessing again:
+### Workflow: Page Interaction (filling forms, clicking buttons)
 
-1. Open a new tab with a targeted Google search:
-   ```
-   new_tab({url: "https://www.google.com/search?q=react+useEffect+infinite+loop+state+dependency"})
-   ```
-2. Read the search results with `get_page_text`
-3. If a Stack Overflow / GitHub issue looks relevant, open it in another new tab and read the solution
-4. Close the research tabs when done — never leave them open
+```
+1. diagnose → get refs (ref_0 <button> "Submit", ref_3 <input> "Email")
+2. fill({ref:"ref_3", value:"test@example.com"})
+3. click({ref:"ref_0"})
+4. wait_for({text:"Success"}) or screenshot to verify
+```
 
-**Search query patterns that work:**
-- Error message in quotes: `"ChunkLoadError" webpack HMR fix`
-- Framework + symptom: `react useEffect infinite render loop`
-- Library + version + issue: `axios 401 interceptor suppress console error`
-- CSS property + context: `css grid gap not working inside flex container`
+### Workflow: Multi-tab Research
 
-Rule: 3 failed fix attempts = MUST search the web before trying again. The answer is almost always on Stack Overflow or in a GitHub issue.
+```
+1. select_tab on the app tab (pin it)
+2. new_tab({url:"https://google.com/search?q=..."})
+3. get_page_text on the research tab
+4. close_tab on the research tab
+5. Continue working on the pinned app tab — it was never disturbed
+```
 
-## Visual Bug Fix Workflow (MUST follow for UI/CSS changes)
+### Workflow: Testing Error States
 
-When the user asks to fix how something looks, or provides target HTML/screenshot:
+```
+1. mock_network({url_pattern:"/api/cart", status_code:500, response_body:"{\"error\":\"Server Error\"}"})
+2. reload
+3. screenshot → see how the app handles the error
+4. (debugger detach stops the mock)
+```
 
-1. **BEFORE editing code:** Use `batch` to gather everything in parallel:
-   ```
-   batch([
-     {name: "screenshot"},
-     {name: "get_styles", arguments: {selector: ".problem-element"}},
-     {name: "get_html", arguments: {selector: ".problem-element"}},
-     {name: "eval", arguments: {code: "document.querySelector('.problem-element')?.className"}}
-   ])
-   ```
+### Workflow: Regression Testing
 
-2. **AFTER every code edit:** IMMEDIATELY take a `screenshot` to verify the change visually. Do NOT claim "this should work" without seeing the screenshot. If the page has HMR, wait 2-3 seconds for the rebuild, then screenshot.
+```
+1. record_actions → interact with the page to reproduce the bug
+2. record_actions({stop:true}) → get the action list
+3. Fix the code
+4. replay_actions({actions: [...]}) → verify the fix
+5. screenshot → confirm
+```
 
-3. **Compare and iterate:** If the screenshot doesn't match what the user asked for:
-   - Use `get_styles` again on the specific element to see what CSS actually applied
-   - Use `eval` to check if the right CSS class/variable is being set
-   - Identify the gap between expected and actual, then fix
-   - Screenshot again to verify
+### Workflow: Visual Diff (before/after comparison)
 
-4. **For complex visual matching:** When the user provides target HTML:
-   - Use `eval` to inject the target HTML into a hidden div and read its computed styles
-   - Compare those computed styles against the current element's styles
-   - Fix the differences one property at a time, verifying each with `get_styles`
+```
+1. screenshot → save the dataUrl
+2. Make code changes → wait for rebuild
+3. visual_diff({before_dataUrl: "data:image/png;base64,..."})
+   → Returns diff % and an image with changes highlighted in red
+```
 
-5. **Never guess CSS values.** Use `get_styles` to read the actual computed values. The source code may use Less variables, calc(), or theme tokens that resolve to values you can't predict from reading the source alone.
+### Workflow: Image Layer / Z-Index Debugging
 
-## Tool Quick Reference (40 tools)
+```
+1. annotate({annotations: [
+     {selector:".base-img", label:"Base Layer", color:"red"},
+     {selector:".overlay-img", label:"Overlay", color:"blue"},
+     {selector:".emb-text", label:"Embroidery", color:"green"}
+   ]}) → screenshot → visually see which layer is which
 
-### Core (use these most)
-| Tool | When to use |
+2. get_element_rect({selector:".composer", include_children:true})
+   → exact position, z-index, opacity of every child element
+
+3. inspect_pixel({selector:".garment-img", x:50, y:30, percent:true})
+   → check if that pixel is transparent (a:0) or opaque — bypasses CORS
+
+4. capture_canvas({selector:".composer"})
+   → flatten all stacked images into one PNG to see the composited result
+
+5. clear_annotations when done
+```
+
+### Workflow: Cross-Product / Cross-Environment Comparison
+
+```
+1. new_tab({url:"https://site.com/product-A"})
+2. new_tab({url:"https://site.com/product-B"})
+3. compare_tabs({tab_id_1: tabA, tab_id_2: tabB})
+   → screenshots of both + diff image with changes in red
+4. close both tabs
+```
+
+### Workflow: State/Cache Manipulation
+
+```
+1. set_storage({key:"customization_cache", action:"remove"}) → clear cached state
+2. reload({bypass_cache:true}) → fresh page load
+3. diagnose → verify behavior with clean state
+```
+
+### Tool Reference (65 tools)
+
+| When you need to... | Use this |
 |---|---|
-| `diagnose` | First call on any page — gives you everything |
-| `batch` | 2+ independent calls in parallel |
-| `select_tab` | Pin a tab once at session start |
-| `eval` | Read app state, run JS, extract specific data |
-| `click` / `fill` / `hover` | Use refs from `diagnose` snapshot |
-| `screenshot` / `full_page_screenshot` | Visual verification |
-| `new_tab` / `close_tab` | Research without leaving the app |
-
-### Debugging
-| Tool | When to use |
-|---|---|
-| `get_console` | Full console log history with stacks |
-| `get_network` | Full request history with response bodies |
-| `get_styles` | CSS computed styles — fonts, colors, spacing, layout |
-| `get_storage` / `get_cookies` | Inspect page state |
-| `watch_dom_changes` | See what mutates when an action happens |
-
-### Performance & Quality
-| Tool | When to use |
-|---|---|
-| `performance_trace` | Core Web Vitals (LCP, FCP, CLS), load times, long tasks |
-| `heap_snapshot_summary` | Memory usage and DOM node count |
-| `get_accessibility_tree` | Full a11y tree for WCAG auditing |
-| `check_contrast` | Color contrast ratio + AA/AAA pass/fail |
-
-### Emulation & Testing
-| Tool | When to use |
-|---|---|
-| `emulate_device` | Switch between mobile/tablet/desktop viewports |
-| `network_throttle` | Test on slow-3g, fast-3g, 4g, or offline |
-| `handle_dialog` | Auto-accept/dismiss alert/confirm/prompt |
-| `export_pdf` | Save page as PDF |
+| First look at any page | `diagnose` |
+| Run 2+ tools at once | `batch` |
+| Pin a tab for the session | `select_tab` |
+| See what page looks like | `screenshot` or `full_page_screenshot` |
+| Read page text | `get_page_text` or `eval` |
+| Read HTML of an element | `get_html` |
+| Read CSS of an element | `get_styles` |
+| Click a button/link | `click` (use ref from diagnose) |
+| Fill an input/form | `fill` (use ref from diagnose) |
+| Hover for tooltip/dropdown | `hover` |
+| Scroll the page | `scroll` |
+| Press keyboard key | `press_key` |
+| Select dropdown option | `select_option` |
+| Upload a file | `upload_file` |
+| Show user which element | `highlight_element` |
+| Open URL without leaving app | `new_tab` |
+| Close a research tab | `close_tab` |
+| Go back in history | `go_back` |
+| Reload the page | `reload` |
+| Wait for element/text | `wait_for` |
+| List all browser tabs | `list_tabs` |
+| Navigate to a URL | `navigate` |
+| See console errors | `get_console` or `get_grouped_console` |
+| See network requests | `get_network` |
+| Search in API responses | `search_network_bodies` |
+| Read cookies | `get_cookies` |
+| Edit/delete a cookie | `edit_cookie` |
+| Read localStorage | `get_storage` |
+| Read clipboard | `get_clipboard` |
+| Watch DOM mutations | `watch_dom_changes` |
+| Generate CSS selectors | `generate_selector` |
+| Test CSS without rebuild | `inject_css` |
+| Compare before/after | `visual_diff` |
+| Record user actions | `record_actions` |
+| Replay recorded actions | `replay_actions` |
+| Mock an API response | `mock_network` |
+| Handle alert/confirm dialog | `handle_dialog` |
+| Get Web Vitals + perf | `performance_trace` |
+| Get memory usage | `heap_snapshot_summary` |
+| Get load waterfall | `get_load_timeline` |
+| Get accessibility tree | `get_accessibility_tree` |
+| Check color contrast | `check_contrast` |
+| Emulate mobile/tablet | `emulate_device` |
+| Throttle network speed | `network_throttle` |
+| Spoof GPS location | `set_geolocation` |
+| Toggle dark mode | `toggle_dark_mode` |
+| Export page as PDF | `export_pdf` |
+| Save form answers for reuse | `save_form_profile` |
+| Load saved form answers | `load_form_profile` |
+| Save all open tabs | `save_tab_session` |
+| Restore saved tabs | `restore_tab_session` |
+| Quick error check | `get_page_info` |
+| Get element snapshot | `snapshot` |
+| Run JS in the page | `eval` |
+| Check pixel color on image | `inspect_pixel` (bypasses CORS) |
+| Get exact element position/box | `get_element_rect` (viewport + parent + children) |
+| Compare two tabs visually | `compare_tabs` (screenshots + diff) |
+| Label elements for debugging | `annotate` (persistent borders + labels) |
+| Remove labels | `clear_annotations` |
+| Flatten stacked images | `capture_canvas` (composited PNG) |
+| Write to localStorage/sessionStorage | `set_storage` |
+| Read the full usage guide | `browser_bridge_help` |
+| Read the full usage guide | `browser_bridge_help` |
