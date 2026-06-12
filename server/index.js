@@ -224,35 +224,66 @@ const HELP_TOOL = {
   inputSchema: { type: "object", properties: {} },
 };
 
-const HELP_TEXT = `# Claude Browser Bridge — 57 Tools Usage Guide
+const HELP_TEXT = `# Claude Browser Bridge — 58 Tools
 
-## CRITICAL RULES (read before using ANY tool):
-1. ALWAYS start with \`diagnose\` — it returns snapshot + console errors + network failures + API responses in ONE call. NEVER call snapshot, get_console, get_network separately.
-2. Use \`batch\` for 2+ independent calls — e.g. batch([{name:"get_cookies"}, {name:"get_storage"}]).
-3. Pin with \`select_tab\` once, then stop passing tab_id — the pin persists.
-4. Use \`new_tab\` for research — NEVER navigate away from the app tab.
-5. After EVERY CSS/UI code change, take a \`screenshot\` to verify. Never claim "this should work" without seeing it.
-6. Use \`inject_css\` to test CSS fixes instantly without rebuilding, then write to file once confirmed.
-7. After 3 failed fix attempts, search the web: new_tab({url:"https://google.com/search?q=..."}).
+## WHICH TOOL FIRST? (decision tree)
+- Investigating a bug → diagnose (gives snapshot + errors + network + API responses in ONE call)
+- Fixing CSS/visual → batch([screenshot, get_styles({selector:".target"}), get_html({selector:".target"})])
+- Performance check → batch([performance_trace, get_load_timeline, heap_snapshot_summary])
+- Accessibility audit → batch([get_accessibility_tree, check_contrast({selector:".text"})])
+- Reading page content → eval (specific data) or get_page_text (all text)
+- Interacting with page → diagnose first (get refs), then click/fill using refs
+- Opening a URL for research → new_tab (NEVER navigate away from the app tab)
+- Don't know → diagnose (covers 80% of needs)
 
-## Tool Categories:
-- Core: diagnose, batch, select_tab, snapshot, eval, screenshot, full_page_screenshot, get_page_text, get_html, get_page_info
-- Interaction: click, fill, hover, scroll, press_key, select_option, upload_file, highlight_element
-- Navigation: navigate, new_tab, close_tab, go_back, go_forward, reload, list_tabs, wait_for
-- Debugging: get_console, get_grouped_console, get_network, search_network_bodies, get_styles, get_cookies, get_storage, get_clipboard, watch_dom_changes, generate_selector
-- Performance: performance_trace, heap_snapshot_summary, get_load_timeline
-- Accessibility: get_accessibility_tree, check_contrast
-- Emulation: emulate_device, network_throttle, set_geolocation, toggle_dark_mode
-- Testing: visual_diff, inject_css, mock_network, record_actions, replay_actions, handle_dialog
-- Productivity: save_form_profile, load_form_profile, save_tab_session, restore_tab_session, edit_cookie, export_pdf
+## 10 CRITICAL RULES:
+1. diagnose FIRST, always. ONE call replaces snapshot+get_console+get_network.
+2. batch for parallel. 2+ independent calls → always batch. Every sequential call wastes 2-3 seconds.
+3. select_tab once, never again. Pin target tab at start, stop passing tab_id.
+4. new_tab for research. NEVER navigate the app tab to docs/Google.
+5. screenshot after EVERY code edit. Never claim a fix works without seeing it.
+6. inject_css before editing files. Test CSS live, confirm with screenshot, THEN write to file.
+7. eval for state. React state, Redux store, variables — faster than parsing page text.
+8. get_styles for CSS. Never guess computed values — read them.
+9. 3 failed attempts = search web. new_tab + Google search. Stop guessing.
+10. Use refs from diagnose/snapshot for click/fill. Never guess CSS selectors.
 
-## Key Workflows:
-- Investigate a page: diagnose → read errors → fix → screenshot to verify
-- Visual bug fix: batch([screenshot, get_styles]) → edit code → screenshot → compare → iterate
-- Performance audit: batch([performance_trace, heap_snapshot_summary, get_load_timeline])
-- Accessibility check: batch([get_accessibility_tree, check_contrast])
-- Test error states: mock_network({url_pattern:"/api/x", status_code:500}) → reload → screenshot
-- Record regression test: record_actions → reproduce bug → stop → fix → replay_actions to verify
+## KEY WORKFLOWS:
+
+Visual/CSS Fix:
+  batch([screenshot, get_styles, get_html]) → inject_css({css:"..."}) → screenshot → if good, write to file
+
+Bug Investigation:
+  diagnose → read errors → batch([get_grouped_console, get_network]) → fix → screenshot → verify
+
+Performance Audit:
+  batch([performance_trace, get_load_timeline, heap_snapshot_summary])
+
+Page Interaction:
+  diagnose → fill({ref:"ref_3", value:"..."}) → click({ref:"ref_0"}) → wait_for({text:"Success"})
+
+Multi-tab Research:
+  select_tab(app) → new_tab(docs) → get_page_text → close_tab → continue on app
+
+Error State Testing:
+  mock_network({url_pattern:"/api/cart", status_code:500}) → reload → screenshot
+
+Regression Testing:
+  record_actions → reproduce → stop → fix → replay_actions → screenshot
+
+Before/After Comparison:
+  screenshot (save dataUrl) → make changes → visual_diff({before_dataUrl:"..."})
+
+## ALL 58 TOOLS BY CATEGORY:
+Core: diagnose, batch, select_tab, snapshot, eval, screenshot, full_page_screenshot, get_page_text, get_html, get_page_info, browser_bridge_help
+Interaction: click, fill, hover, scroll, press_key, select_option, upload_file, highlight_element
+Navigation: navigate, new_tab, close_tab, go_back, go_forward, reload, list_tabs, wait_for
+Debugging: get_console, get_grouped_console, get_network, search_network_bodies, get_styles, get_cookies, get_storage, get_clipboard, watch_dom_changes, generate_selector
+Performance: performance_trace, heap_snapshot_summary, get_load_timeline
+Accessibility: get_accessibility_tree, check_contrast
+Emulation: emulate_device, network_throttle, set_geolocation, toggle_dark_mode
+Testing: visual_diff, inject_css, mock_network, record_actions, replay_actions, handle_dialog
+Productivity: save_form_profile, load_form_profile, save_tab_session, restore_tab_session, edit_cookie, export_pdf
 `;
 
 const BATCH_TOOL = {
