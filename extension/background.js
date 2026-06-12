@@ -56,16 +56,25 @@ function ensureConnected() {
   };
 }
 
+// F1 FIX: Aggressive keepalive to prevent Chrome from killing the service worker.
+// MV3 workers die after 30s of inactivity. We use three strategies:
+// 1. WebSocket pings every 20s (keeps the worker "active" with pending I/O)
+// 2. chrome.alarms at minimum interval (fires every ~20-30s)
+// 3. Any incoming message from popup wakes the worker via onMessage
 setInterval(() => {
   if (socket?.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: "ping" }));
+  } else {
+    ensureConnected();
   }
-}, 25000);
+}, 20000);
 
-chrome.alarms.create("bridge-keepalive", { periodInMinutes: 0.5 });
+chrome.alarms.create("bridge-keepalive", { periodInMinutes: 1/3 });
 chrome.alarms.onAlarm.addListener(() => ensureConnected());
 chrome.runtime.onStartup.addListener(() => ensureConnected());
 chrome.runtime.onInstalled.addListener(() => ensureConnected());
+// Extra wake-up: any tab update triggers a connection check
+chrome.tabs.onActivated.addListener(() => ensureConnected());
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "status") {
@@ -81,6 +90,25 @@ let targetTabId = null;
 let markedTabId = null;
 let markerGrouped = false;
 const injectedTabs = new Set(); // tracks tabs with inject.js already present
+const debuggerTabs = new Set(); // F3 FIX: tracks tabs with debugger attached
+
+// F3 FIX: safe debugger attach/detach that tracks state
+async function safeDebuggerAttach(tabId) {
+  if (debuggerTabs.has(tabId)) return; // already attached
+  await chrome.debugger.attach({ tabId }, "1.3");
+  debuggerTabs.add(tabId);
+}
+async function safeDebuggerDetach(tabId) {
+  if (!debuggerTabs.has(tabId)) return;
+  await chrome.debugger.detach({ tabId }).catch(() => {});
+  debuggerTabs.delete(tabId);
+}
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId) debuggerTabs.delete(source.tabId);
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  debuggerTabs.delete(tabId);
+});
 
 chrome.storage.session
   .get("targetTabId")
@@ -251,7 +279,15 @@ function pageLocateAndAct(sel, ref, timeoutMs, action, value) {
         setTimeout(attempt, 150); // was 200 — faster polling
         return;
       }
-      el.scrollIntoView({ block: "center" });
+      // F4 FIX: catch Illegal invocation from GC'd DOM refs and translate to stale-ref message
+      try {
+        el.scrollIntoView({ block: "center" });
+      } catch (scrollErr) {
+        resolve({ error: ref !== null && ref !== undefined
+          ? `ref_${ref} is stale (element was garbage collected) — take a new snapshot`
+          : `Element no longer accessible: ${scrollErr.message}` });
+        return;
+      }
       try {
         if (action === "click") {
           el.click();
@@ -273,7 +309,12 @@ function pageLocateAndAct(sel, ref, timeoutMs, action, value) {
         }
         resolve({ ok: true, waitedMs: Date.now() - started });
       } catch (e) {
-        resolve({ error: String(e) });
+        const msg = String(e?.message || e);
+        if (msg.includes("Illegal invocation") && ref !== null && ref !== undefined) {
+          resolve({ error: `ref_${ref} is stale (element was garbage collected) — take a new snapshot` });
+        } else {
+          resolve({ error: msg });
+        }
       }
     };
     attempt();
@@ -693,7 +734,7 @@ async function handle(msg) {
       const ref = parseRef(params.ref);
       if (ref === null && !params.selector) throw new Error("Provide 'ref' or 'selector' for the file input");
       if (!params.file_path) throw new Error("'file_path' is required");
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.enable");
         const { root } = await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.getDocument");
@@ -726,7 +767,7 @@ async function handle(msg) {
         );
         return { uploaded: params.file_path, to: params.selector || `ref_${ref}` };
       } finally {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
       }
     }
 
@@ -869,7 +910,7 @@ async function handle(msg) {
     }
 
     case "get_accessibility_tree": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         await chrome.debugger.sendCommand({ tabId: tab.id }, "Accessibility.enable");
         const { nodes } = await chrome.debugger.sendCommand(
@@ -888,12 +929,12 @@ async function handle(msg) {
           .filter(n => n.name || n.role !== "StaticText");
         return { tab_id: tab.id, url: tab.url, nodes: filtered };
       } finally {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
       }
     }
 
     case "performance_trace": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         await chrome.debugger.sendCommand({ tabId: tab.id }, "Performance.enable");
         // Collect metrics
@@ -928,12 +969,12 @@ async function handle(msg) {
         return { tab_id: tab.id, url: tab.url, webVitals: timing, cdpMetrics: metricsObj };
       } finally {
         await chrome.debugger.sendCommand({ tabId: tab.id }, "Performance.disable").catch(() => {});
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
       }
     }
 
     case "heap_snapshot_summary": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         await chrome.debugger.sendCommand({ tabId: tab.id }, "HeapProfiler.enable");
         // Collect heap stats without a full snapshot (faster)
@@ -960,12 +1001,12 @@ async function handle(msg) {
         };
       } finally {
         await chrome.debugger.sendCommand({ tabId: tab.id }, "HeapProfiler.disable").catch(() => {});
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
       }
     }
 
     case "emulate_device": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         const presets = {
           "mobile": { width: 375, height: 812, scale: 3, mobile: true, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
@@ -977,7 +1018,7 @@ async function handle(msg) {
         if (params.clear || device === "reset") {
           await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.clearDeviceMetricsOverride");
           await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setUserAgentOverride", { userAgent: "" });
-          await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+          await safeDebuggerDetach(tab.id);
           return { tab_id: tab.id, emulation: "cleared" };
         }
         const w = params.width || preset?.width || 1440;
@@ -995,13 +1036,13 @@ async function handle(msg) {
         // Don't detach — keep emulation active until cleared
         return { tab_id: tab.id, emulation: { width: w, height: h, scale, mobile, device: device || "custom" } };
       } catch (e) {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
         throw e;
       }
     }
 
     case "network_throttle": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.enable");
         const presets = {
@@ -1014,17 +1055,17 @@ async function handle(msg) {
         const preset = presets[params.preset?.toLowerCase()] || presets.none;
         await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.emulateNetworkConditions", preset);
         if (params.preset === "none") {
-          await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+          await safeDebuggerDetach(tab.id);
         }
         return { tab_id: tab.id, throttle: params.preset || "none" };
       } catch (e) {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
         throw e;
       }
     }
 
     case "full_page_screenshot": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         if (markedTabId === tab.id) await applyMarker(tab.id, false);
         const { data } = await chrome.debugger.sendCommand(
@@ -1033,12 +1074,12 @@ async function handle(msg) {
         if (markedTabId === tab.id) applyMarker(tab.id, true);
         return { tab_id: tab.id, url: tab.url, dataUrl: "data:image/png;base64," + data };
       } finally {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
       }
     }
 
     case "export_pdf": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         const { data } = await chrome.debugger.sendCommand(
           { tabId: tab.id }, "Page.printToPDF", {
@@ -1049,7 +1090,7 @@ async function handle(msg) {
         );
         return { tab_id: tab.id, url: tab.url, pdfBase64: data.slice(0, 50000), totalLength: data.length };
       } finally {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
       }
     }
 
@@ -1130,7 +1171,7 @@ async function handle(msg) {
     }
 
     case "handle_dialog": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.enable");
         // Set up handler for the next dialog
@@ -1144,7 +1185,7 @@ async function handle(msg) {
         });
         return { tab_id: tab.id, action: accept ? "will accept" : "will dismiss", note: "Waiting for the next dialog" };
       } catch (e) {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
         throw e;
       }
     }
@@ -1168,8 +1209,9 @@ async function handle(msg) {
 
     case "visual_diff": {
       // Compare two screenshots and highlight pixel differences.
-      // Takes a "before" screenshot from params.before_dataUrl or captures current state as "after".
       if (!tab.active) { await chrome.tabs.update(tab.id, { active: true }); await new Promise(r => setTimeout(r, 200)); }
+      // F5 FIX: wait for paint before capturing "after" so injected CSS is rendered
+      await execInTab(tab.id, () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 100))), [], "MAIN");
       if (markedTabId === tab.id) await applyMarker(tab.id, false);
       const afterUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
       if (markedTabId === tab.id) applyMarker(tab.id, true);
@@ -1316,7 +1358,7 @@ async function handle(msg) {
     }
 
     case "mock_network": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         await chrome.debugger.sendCommand({ tabId: tab.id }, "Fetch.enable", {
           patterns: [{ urlPattern: params.url_pattern || "*", requestStage: "Response" }],
@@ -1337,7 +1379,7 @@ async function handle(msg) {
         });
         return { tab_id: tab.id, mocking: params.url_pattern, status: params.status_code || 200, note: "Network mock active. Reload or navigate to trigger. Detach debugger to stop." };
       } catch (e) {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
         throw e;
       }
     }
@@ -1564,11 +1606,11 @@ async function handle(msg) {
     // =====================================================================
 
     case "set_geolocation": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         if (params.clear) {
           await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.clearGeolocationOverride");
-          await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+          await safeDebuggerDetach(tab.id);
           return { tab_id: tab.id, geolocation: "cleared" };
         }
         await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setGeolocationOverride", {
@@ -1576,13 +1618,13 @@ async function handle(msg) {
         });
         return { tab_id: tab.id, geolocation: { lat: params.latitude || 28.6139, lng: params.longitude || 77.2090 } };
       } catch (e) {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
         throw e;
       }
     }
 
     case "toggle_dark_mode": {
-      await chrome.debugger.attach({ tabId: tab.id }, "1.3");
+      await safeDebuggerAttach(tab.id);
       try {
         const isDark = params.dark !== false;
         await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setEmulatedMedia", {
@@ -1590,7 +1632,7 @@ async function handle(msg) {
         });
         return { tab_id: tab.id, darkMode: isDark };
       } catch (e) {
-        await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+        await safeDebuggerDetach(tab.id);
         throw e;
       }
     }

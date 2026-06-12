@@ -17,14 +17,20 @@ import WebSocket, { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.BRIDGE_PORT) || 8787;
 
-let TOKEN = null;
-try {
-  TOKEN = readFileSync(new URL("./.bridge-token", import.meta.url), "utf8").trim();
-} catch {}
-if (!TOKEN) {
+// F2 FIX: Re-read token on every auth attempt so `init` token regeneration
+// takes effect without restarting the server.
+const TOKEN_PATH = new URL("./.bridge-token", import.meta.url);
+function readToken() {
+  try {
+    return readFileSync(TOKEN_PATH, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+if (!readToken()) {
   console.error(
-    "[bridge] WARNING: server/.bridge-token is missing — run `node gen-token.js` " +
-      "in the server directory. Refusing all extension connections until then."
+    "[bridge] WARNING: server/.bridge-token is missing — run `claude-browser-bridge init` " +
+      "or `node gen-token.js`. Refusing all extension connections until then."
   );
 }
 
@@ -87,7 +93,7 @@ function setupOwner(wss) {
       }
 
       if (!role) {
-        if (msg.type === "auth" && TOKEN && msg.token === TOKEN) {
+        if (msg.type === "auth" && readToken() && msg.token === readToken()) {
           role = msg.role === "relay" ? "relay" : "extension";
           clearTimeout(authTimer);
           if (role === "extension") {
@@ -150,7 +156,7 @@ function connectRelay() {
   mode = "relay";
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
   ws.on("open", () => {
-    ws.send(JSON.stringify({ type: "auth", token: TOKEN, role: "relay" }));
+    ws.send(JSON.stringify({ type: "auth", token: readToken(), role: "relay" }));
     upstream = ws;
     console.error(`[bridge] relay mode: forwarding through the session that owns port ${PORT}`);
   });
