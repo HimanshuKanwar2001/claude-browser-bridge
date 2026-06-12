@@ -877,10 +877,89 @@ const TOOLS = [
       required: ["query"],
     },
   },
+  // =================== SESSION-REQUESTED TOOLS ===================
+  {
+    name: "inspect_pixel",
+    description: "Sample RGBA color at a specific pixel coordinate on any rendered element. Bypasses CORS restrictions on images. Use percent=true to specify x/y as percentages of the element's size (e.g. x:50, y:50 = center). Returns hex color, opacity, and element bounding box.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string" }, ref: { type: "string" },
+        x: { type: "number", description: "X coordinate (pixels from element left, or percentage if percent=true)" },
+        y: { type: "number", description: "Y coordinate (pixels from element top, or percentage if percent=true)" },
+        percent: { type: "boolean", description: "If true, x/y are percentages (0-100) of the element size" },
+        ...TAB_ID,
+      },
+    },
+  },
+  {
+    name: "get_element_rect",
+    description: "Get exact computed position (viewport + offset + scroll), size, z-index, visibility, opacity, and parent info for any element. Use include_children=true to also get bounding boxes of all child elements — essential for debugging stacking/layering issues.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string" }, ref: { type: "string" },
+        include_children: { type: "boolean", description: "Also return child element rects (default false)" },
+        ...TAB_ID,
+      },
+    },
+  },
+  {
+    name: "compare_tabs",
+    description: "Screenshot two tabs side by side and compute a pixel diff between them. Returns both screenshots plus a diff image with changes in red. Use for comparing the same page across products, environments (prod vs staging), or before/after states.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tab_id_1: { type: "number", description: "First tab to screenshot" },
+        tab_id_2: { type: "number", description: "Second tab to screenshot" },
+      },
+      required: ["tab_id_1", "tab_id_2"],
+    },
+  },
+  {
+    name: "annotate",
+    description: "Draw persistent colored borders + labels on elements for visual debugging. Annotations stay visible across screenshots — use to identify layers, z-index stacking, or mark multiple elements at once. Call clear_annotations to remove them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string" }, ref: { type: "string" },
+        label: { type: "string", description: "Text label shown above the element" },
+        color: { type: "string", description: "Border/label color (default '#D97757')" },
+        annotations: { type: "array", items: { type: "object" }, description: "Array of {selector, ref, label, color} for annotating multiple elements at once" },
+        ...TAB_ID,
+      },
+    },
+  },
+  {
+    name: "clear_annotations",
+    description: "Remove all annotations drawn by the annotate tool.",
+    inputSchema: { type: "object", properties: { ...TAB_ID } },
+  },
+  {
+    name: "capture_canvas",
+    description: "Flatten stacked child images inside a container element into a single canvas capture (like the browser renders them). Returns a PNG. Use for inspecting composited garment/image layers where individual images stack via z-index.",
+    inputSchema: {
+      type: "object",
+      properties: { selector: { type: "string" }, ref: { type: "string" }, ...TAB_ID },
+    },
+  },
+  {
+    name: "set_storage",
+    description: "Write to localStorage or sessionStorage. Handles complex JSON objects safely. Use action='remove' to delete a key, action='clear' to clear all storage.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string" }, value: { description: "Value to set (string or JSON object)" },
+        storage_type: { type: "string", enum: ["local", "session"], description: "Default: local" },
+        action: { type: "string", enum: ["set", "remove", "clear"], description: "Default: set" },
+        ...TAB_ID,
+      },
+    },
+  },
 ];
 
 const server = new Server(
-  { name: "browser-bridge", version: "3.0.0" },
+  { name: "browser-bridge", version: "4.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -903,6 +982,25 @@ function formatResult(name, result) {
       content: [
         { type: "image", data: base64, mimeType: "image/png" },
         { type: "text", text: JSON.stringify(rest, null, 2) },
+      ],
+    };
+  }
+  if (name === "capture_canvas" && result?.dataUrl) {
+    const base64 = result.dataUrl.replace(/^data:image\/png;base64,/, "");
+    const { dataUrl, ...rest } = result;
+    return {
+      content: [
+        { type: "image", data: base64, mimeType: "image/png" },
+        { type: "text", text: JSON.stringify(rest, null, 2) },
+      ],
+    };
+  }
+  if (name === "compare_tabs" && result?.diffImage) {
+    const diffBase64 = result.diffImage.replace(/^data:image\/png;base64,/, "");
+    return {
+      content: [
+        { type: "text", text: `Diff: ${result.diffPercent}% changed (${result.diffPixels} pixels)` },
+        { type: "image", data: diffBase64, mimeType: "image/png" },
       ],
     };
   }

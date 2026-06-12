@@ -1696,6 +1696,274 @@ async function handle(msg) {
       return { tab_id: tab.id, query: params.query, matches };
     }
 
+    // =====================================================================
+    // Session-requested tools (#1-#6 from debugging feedback)
+    // =====================================================================
+
+    case "inspect_pixel": {
+      // #1: Sample RGBA at a coordinate on any rendered element (bypasses CORS on images)
+      await safeDebuggerAttach(tab.id);
+      try {
+        // Use CDP to screenshot just the element region, then read the pixel from the image
+        const x = params.x ?? 0;
+        const y = params.y ?? 0;
+        const sel = params.selector;
+        const ref = parseRef(params.ref);
+
+        // Get element's viewport position
+        const rect = await execInTab(
+          tab.id,
+          (sel, refIdx) => {
+            const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            return { x: r.x, y: r.y, w: r.width, h: r.height };
+          },
+          [sel || null, ref],
+          "MAIN"
+        );
+        if (!rect) throw new Error("Element not found");
+
+        // Calculate absolute pixel position
+        const pixelX = params.percent ? Math.round(rect.x + rect.w * (x / 100)) : Math.round(rect.x + x);
+        const pixelY = params.percent ? Math.round(rect.y + rect.h * (y / 100)) : Math.round(rect.y + y);
+
+        // Capture a 1x1 screenshot at that exact pixel using CDP
+        const { data } = await chrome.debugger.sendCommand(
+          { tabId: tab.id }, "Page.captureScreenshot",
+          { format: "png", clip: { x: pixelX, y: pixelY, width: 1, height: 1, scale: 1 } }
+        );
+
+        // Decode PNG to get RGBA — the 1x1 PNG has a known structure
+        // Simpler: capture a small region and use canvas
+        const rgba = await execInTab(
+          tab.id,
+          async (imgData, px, py, elRect) => {
+            const img = new Image();
+            const canvas = document.createElement("canvas");
+            canvas.width = 10; canvas.height = 10;
+            return new Promise(resolve => {
+              img.onload = () => {
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(img, 0, 0);
+                const pixel = ctx.getImageData(0, 0, 1, 1).data;
+                resolve({ r: pixel[0], g: pixel[1], b: pixel[2], a: pixel[3], hex: "#" + [pixel[0], pixel[1], pixel[2]].map(v => v.toString(16).padStart(2, "0")).join(""), opacity: Math.round(pixel[3] / 255 * 100) + "%", at: { x: px, y: py }, elementBox: elRect });
+              };
+              img.onerror = () => resolve({ error: "Failed to decode pixel" });
+              img.src = "data:image/png;base64," + imgData;
+            });
+          },
+          [data, pixelX, pixelY, rect],
+          "MAIN"
+        );
+        return { tab_id: tab.id, ...rgba };
+      } finally {
+        await safeDebuggerDetach(tab.id);
+      }
+    }
+
+    case "get_element_rect": {
+      // #2: Get exact computed position, size, and relationship to parent/viewport
+      const ref = parseRef(params.ref);
+      const result = await execInTab(
+        tab.id,
+        (sel, refIdx, includeChildren) => {
+          const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+          if (!el) return { error: "Element not found" };
+          const vr = el.getBoundingClientRect();
+          const parent = el.offsetParent;
+          const pr = parent?.getBoundingClientRect();
+          const result = {
+            tag: el.tagName.toLowerCase(),
+            id: el.id || undefined,
+            className: el.className?.toString().slice(0, 100) || undefined,
+            viewport: { x: Math.round(vr.x), y: Math.round(vr.y), width: Math.round(vr.width), height: Math.round(vr.height), bottom: Math.round(vr.bottom), right: Math.round(vr.right) },
+            offset: { top: el.offsetTop, left: el.offsetLeft, width: el.offsetWidth, height: el.offsetHeight },
+            scroll: { top: el.scrollTop, left: el.scrollLeft, width: el.scrollWidth, height: el.scrollHeight },
+            parent: parent ? { tag: parent.tagName.toLowerCase(), viewport: { x: Math.round(pr.x), y: Math.round(pr.y), width: Math.round(pr.width), height: Math.round(pr.height) } } : null,
+            zIndex: window.getComputedStyle(el).zIndex,
+            position: window.getComputedStyle(el).position,
+            display: window.getComputedStyle(el).display,
+            visibility: window.getComputedStyle(el).visibility,
+            opacity: window.getComputedStyle(el).opacity,
+            overflow: window.getComputedStyle(el).overflow,
+            isVisible: vr.width > 0 && vr.height > 0 && window.getComputedStyle(el).visibility !== "hidden" && window.getComputedStyle(el).display !== "none",
+          };
+          if (includeChildren) {
+            result.children = [...el.children].slice(0, 20).map(c => {
+              const cr = c.getBoundingClientRect();
+              return { tag: c.tagName.toLowerCase(), className: c.className?.toString().slice(0, 60), viewport: { x: Math.round(cr.x), y: Math.round(cr.y), w: Math.round(cr.width), h: Math.round(cr.height) }, zIndex: window.getComputedStyle(c).zIndex };
+            });
+          }
+          return result;
+        },
+        [params.selector || null, ref, Boolean(params.include_children)],
+        "MAIN"
+      );
+      if (result?.error) throw new Error(result.error);
+      return { tab_id: tab.id, ...result };
+    }
+
+    case "compare_tabs": {
+      // #3: Screenshot two tabs and return both images for side-by-side comparison
+      const tab1 = params.tab_id_1;
+      const tab2 = params.tab_id_2;
+      if (!tab1 || !tab2) throw new Error("Both tab_id_1 and tab_id_2 are required");
+
+      // Capture tab 1
+      await chrome.tabs.update(tab1, { active: true });
+      await new Promise(r => setTimeout(r, 400));
+      if (markedTabId === tab1) await applyMarker(tab1, false);
+      const img1 = await chrome.tabs.captureVisibleTab((await chrome.tabs.get(tab1)).windowId, { format: "png" });
+      if (markedTabId === tab1) applyMarker(tab1, true);
+
+      // Capture tab 2
+      await chrome.tabs.update(tab2, { active: true });
+      await new Promise(r => setTimeout(r, 400));
+      if (markedTabId === tab2) await applyMarker(tab2, false);
+      const img2 = await chrome.tabs.captureVisibleTab((await chrome.tabs.get(tab2)).windowId, { format: "png" });
+      if (markedTabId === tab2) applyMarker(tab2, true);
+
+      // Compute diff
+      const diff = await execInTab(
+        tab2,
+        (src1, src2) => {
+          return new Promise(resolve => {
+            const imgA = new Image(); const imgB = new Image();
+            let loaded = 0;
+            const onLoad = () => {
+              if (++loaded < 2) return;
+              const w = Math.min(imgA.width, imgB.width);
+              const h = Math.min(imgA.height, imgB.height);
+              const canvas = document.createElement("canvas");
+              canvas.width = w; canvas.height = h;
+              const ctx = canvas.getContext("2d");
+              ctx.drawImage(imgA, 0, 0);
+              const dataA = ctx.getImageData(0, 0, w, h);
+              ctx.drawImage(imgB, 0, 0);
+              const dataB = ctx.getImageData(0, 0, w, h);
+              let diffCount = 0;
+              for (let i = 0; i < dataA.data.length; i += 4) {
+                const d = Math.abs(dataA.data[i] - dataB.data[i]) + Math.abs(dataA.data[i+1] - dataB.data[i+1]) + Math.abs(dataA.data[i+2] - dataB.data[i+2]);
+                if (d > 30) { dataB.data[i] = 255; dataB.data[i+1] = 0; dataB.data[i+2] = 0; dataB.data[i+3] = 200; diffCount++; }
+              }
+              ctx.putImageData(dataB, 0, 0);
+              resolve({ diffPercent: Math.round(diffCount / (w * h) * 10000) / 100, diffPixels: diffCount, diffImage: canvas.toDataURL("image/png") });
+            };
+            imgA.onload = onLoad; imgB.onload = onLoad;
+            imgA.src = src1; imgB.src = src2;
+          });
+        },
+        [img1, img2],
+        "MAIN"
+      );
+
+      return { tab_id_1: tab1, tab_id_2: tab2, screenshot1: img1, screenshot2: img2, ...diff };
+    }
+
+    case "annotate": {
+      // #4: Draw persistent labeled overlays on elements for visual debugging
+      const annotations = params.annotations || [{ selector: params.selector, ref: params.ref, label: params.label || "", color: params.color || "#D97757" }];
+      const result = await execInTab(
+        tab.id,
+        (annList) => {
+          // Clear previous annotations
+          document.querySelectorAll(".__claude_annotation__").forEach(e => e.remove());
+          const results = [];
+          for (const ann of annList) {
+            const refIdx = ann.ref !== null && ann.ref !== undefined ? Number(String(ann.ref).replace(/^ref_/, "")) : null;
+            const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (ann.selector ? document.querySelector(ann.selector) : null);
+            if (!el) { results.push({ error: "Not found: " + (ann.selector || "ref_" + refIdx) }); continue; }
+            const rect = el.getBoundingClientRect();
+            const overlay = document.createElement("div");
+            overlay.className = "__claude_annotation__";
+            overlay.style.cssText = `position:fixed;left:${rect.left-2}px;top:${rect.top-2}px;width:${rect.width+4}px;height:${rect.height+4}px;border:2px solid ${ann.color};z-index:2147483646;pointer-events:none;box-sizing:border-box;`;
+            if (ann.label) {
+              const lbl = document.createElement("div");
+              lbl.textContent = ann.label;
+              lbl.style.cssText = `position:absolute;top:-18px;left:0;background:${ann.color};color:#fff;font:bold 10px/1.6 sans-serif;padding:0 6px;border-radius:3px 3px 0 0;white-space:nowrap;`;
+              overlay.appendChild(lbl);
+            }
+            document.body.appendChild(overlay);
+            results.push({ label: ann.label, tag: el.tagName.toLowerCase(), box: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) } });
+          }
+          return results;
+        },
+        [annotations],
+        "MAIN"
+      );
+      return { tab_id: tab.id, annotations: result };
+    }
+
+    case "clear_annotations": {
+      await execInTab(tab.id, () => { document.querySelectorAll(".__claude_annotation__").forEach(e => e.remove()); return true; }, [], "MAIN");
+      return { tab_id: tab.id, cleared: true };
+    }
+
+    case "capture_canvas": {
+      // #5: Flatten stacked elements into a single canvas capture, return as PNG
+      const ref = parseRef(params.ref);
+      const result = await execInTab(
+        tab.id,
+        async (sel, refIdx) => {
+          const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+          if (!el) return { error: "Element not found" };
+          const rect = el.getBoundingClientRect();
+          // Use html2canvas-like approach: draw to an offscreen canvas via drawImage
+          const canvas = document.createElement("canvas");
+          const dpr = window.devicePixelRatio || 1;
+          canvas.width = Math.round(rect.width * dpr);
+          canvas.height = Math.round(rect.height * dpr);
+          const ctx = canvas.getContext("2d");
+          ctx.scale(dpr, dpr);
+          // Collect all child images and draw them in order (z-index stacking)
+          const images = el.querySelectorAll("img");
+          const draws = [];
+          for (const img of images) {
+            if (!img.complete || img.naturalWidth === 0) continue;
+            const ir = img.getBoundingClientRect();
+            draws.push({ img, x: ir.x - rect.x, y: ir.y - rect.y, w: ir.width, h: ir.height, zIndex: parseInt(window.getComputedStyle(img).zIndex) || 0 });
+          }
+          draws.sort((a, b) => a.zIndex - b.zIndex);
+          for (const d of draws) {
+            try {
+              ctx.drawImage(d.img, d.x, d.y, d.w, d.h);
+            } catch (e) {
+              // CORS — try with crossOrigin
+            }
+          }
+          return {
+            dataUrl: canvas.toDataURL("image/png"),
+            width: canvas.width,
+            height: canvas.height,
+            imageCount: draws.length,
+            elementBox: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+          };
+        },
+        [params.selector || null, ref],
+        "MAIN"
+      );
+      if (result?.error) throw new Error(result.error);
+      return { tab_id: tab.id, ...result };
+    }
+
+    case "set_storage": {
+      // #6: Write to localStorage/sessionStorage (eval was fragile for complex JSON)
+      const result = await execInTab(
+        tab.id,
+        (storageType, key, value, action) => {
+          const store = storageType === "session" ? sessionStorage : localStorage;
+          if (action === "clear") { store.clear(); return { cleared: storageType }; }
+          if (action === "remove") { store.removeItem(key); return { removed: key }; }
+          store.setItem(key, typeof value === "string" ? value : JSON.stringify(value));
+          return { set: key, length: store.getItem(key)?.length };
+        },
+        [params.storage_type || "local", params.key, params.value, params.action || "set"],
+        "MAIN"
+      );
+      return { tab_id: tab.id, ...result };
+    }
+
     default:
       throw new Error("Unknown method: " + msg.method);
   }

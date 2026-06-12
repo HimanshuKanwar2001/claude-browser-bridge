@@ -1,6 +1,6 @@
 {
   "name": "claude-browser-bridge",
-  "version": "3.0.3",
+  "version": "3.0.4",
   "description": "Connect your live Chrome tabs to Claude Code — 57 tools for debugging, performance, accessibility, device emulation, and browser automation.",
   "type": "module",
   "bin": {
