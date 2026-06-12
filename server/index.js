@@ -6,7 +6,9 @@
 // "owns" the bridge; later sessions detect EADDRINUSE and relay their tool
 // calls through the owner. If the owner exits, a relay takes over the port.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -17,20 +19,32 @@ import WebSocket, { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.BRIDGE_PORT) || 8787;
 
-// F2 FIX: Re-read token on every auth attempt so `init` token regeneration
-// takes effect without restarting the server.
-const TOKEN_PATH = new URL("./.bridge-token", import.meta.url);
+// Token resolution: check multiple locations so it works whether the server
+// runs from a global npm install, npx, or the cloned repo.
+const TOKEN_LOCATIONS = [
+  process.env.BRIDGE_TOKEN_PATH,                              // explicit override
+  join(homedir(), ".claude", "browser-bridge-token"),          // canonical home path
+  new URL("./.bridge-token", import.meta.url).pathname,       // relative to server file (repo install)
+  join(process.cwd(), "server", ".bridge-token"),              // cwd/server/ (cloned repo)
+  join(process.cwd(), ".bridge-token"),                        // cwd root
+].filter(Boolean);
+
 function readToken() {
-  try {
-    return readFileSync(TOKEN_PATH, "utf8").trim();
-  } catch {
-    return null;
+  // Also check env var directly
+  if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN;
+  for (const p of TOKEN_LOCATIONS) {
+    try {
+      const t = readFileSync(p, "utf8").trim();
+      if (t) return t;
+    } catch {}
   }
+  return null;
 }
 if (!readToken()) {
   console.error(
-    "[bridge] WARNING: server/.bridge-token is missing — run `claude-browser-bridge init` " +
-      "or `node gen-token.js`. Refusing all extension connections until then."
+    "[bridge] WARNING: auth token not found. Run `claude-browser-bridge init` " +
+      "or `node gen-token.js`. Searched:\n" +
+      TOKEN_LOCATIONS.map(p => "  - " + p).join("\n")
   );
 }
 

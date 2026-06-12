@@ -44,14 +44,25 @@ Docs: https://github.com/HimanshuKanwar2001/claude-browser-bridge
 `);
 }
 
-function init() {
+async function init() {
   const extPath = args[args.indexOf("init") + 1] || null;
-  const tokenPath = join(SERVER_DIR, ".bridge-token");
   const token = randomBytes(24).toString("hex");
+  const os = await import("node:os");
+  const home = os.homedir();
 
-  // Write server token
-  writeFileSync(tokenPath, token + "\n");
-  console.log(`✓ Token written to ${tokenPath}`);
+  // Write to canonical path: ~/.claude/browser-bridge-token
+  const claudeDir = join(home, ".claude");
+  if (!existsSync(claudeDir)) mkdirSync(claudeDir, { recursive: true });
+  const canonicalPath = join(home, ".claude", "browser-bridge-token");
+  writeFileSync(canonicalPath, token + "\n");
+  console.log(`✓ Token written to ${canonicalPath}`);
+
+  // Also write to server/.bridge-token (legacy fallback)
+  try {
+    const legacyPath = join(SERVER_DIR, ".bridge-token");
+    writeFileSync(legacyPath, token + "\n");
+    console.log(`✓ Token written to ${legacyPath}`);
+  } catch {}
 
   // Write extension config if we can find the extension directory
   const searchPaths = [
