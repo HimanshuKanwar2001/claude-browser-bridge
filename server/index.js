@@ -6,9 +6,10 @@
 // "owns" the bridge; later sessions detect EADDRINUSE and relay their tool
 // calls through the owner. If the owner exits, a relay takes over the port.
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname, userInfo } from "node:os";
+import { createHash } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -19,33 +20,46 @@ import WebSocket, { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.BRIDGE_PORT) || 8787;
 
-// Token resolution: check multiple locations so it works whether the server
-// runs from a global npm install, npx, or the cloned repo.
-const TOKEN_LOCATIONS = [
-  process.env.BRIDGE_TOKEN_PATH,                              // explicit override
-  join(homedir(), ".claude", "browser-bridge-token"),          // canonical home path
-  new URL("./.bridge-token", import.meta.url).pathname,       // relative to server file (repo install)
-  join(process.cwd(), "server", ".bridge-token"),              // cwd/server/ (cloned repo)
-  join(process.cwd(), ".bridge-token"),                        // cwd root
-].filter(Boolean);
+// Deterministic token: derived from machine identity (username + hostname).
+// Same token every time on the same machine — no file sync issues, no
+// regeneration needed, no stale-token bugs across sessions.
+// Falls back to file-based token if BRIDGE_TOKEN env var or token file exists.
+function deriveToken() {
+  const identity = `claude-browser-bridge:${userInfo().username}@${hostname()}:${PORT}`;
+  return createHash("sha256").update(identity).digest("hex");
+}
 
 function readToken() {
-  // Also check env var directly
+  // 1. Explicit env var override
   if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN;
-  for (const p of TOKEN_LOCATIONS) {
+  // 2. File-based token (legacy — checked for backwards compatibility)
+  const filePaths = [
+    process.env.BRIDGE_TOKEN_PATH,
+    join(homedir(), ".claude", "browser-bridge-token"),
+    new URL("./.bridge-token", import.meta.url).pathname,
+    join(process.cwd(), "server", ".bridge-token"),
+    join(process.cwd(), ".bridge-token"),
+  ].filter(Boolean);
+  for (const p of filePaths) {
     try {
       const t = readFileSync(p, "utf8").trim();
       if (t) return t;
     } catch {}
   }
-  return null;
+  // 3. Deterministic token (always works, no files needed)
+  return deriveToken();
 }
-if (!readToken()) {
-  console.error(
-    "[bridge] WARNING: auth token not found. Run `claude-browser-bridge init` " +
-      "or `node gen-token.js`. Searched:\n" +
-      TOKEN_LOCATIONS.map(p => "  - " + p).join("\n")
-  );
+
+// Write the deterministic token to the canonical location so gen-token.js
+// isn't required anymore (but still works for custom tokens).
+const canonicalDir = join(homedir(), ".claude");
+const canonicalPath = join(canonicalDir, "browser-bridge-token");
+if (!existsSync(canonicalPath)) {
+  try {
+    if (!existsSync(canonicalDir)) mkdirSync(canonicalDir, { recursive: true });
+    writeFileSync(canonicalPath, deriveToken() + "\n");
+    console.error(`[bridge] Auto-generated token at ${canonicalPath}`);
+  } catch {}
 }
 
 // --- WebSocket bridge (owner or relay) -------------------------------------

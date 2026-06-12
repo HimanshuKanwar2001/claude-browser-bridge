@@ -1,6 +1,6 @@
 {
   "name": "@private/chrom-extension",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Connects your **real, logged-in Chrome tabs** to local Claude Code — no separate debugging Chrome, no re-logging-in, no new tabs. A Chrome extension talks to a local MCP server over `ws://localhost:8787`; Claude Code talks to that server over stdio.",
   "type": "module",
   "scripts": {

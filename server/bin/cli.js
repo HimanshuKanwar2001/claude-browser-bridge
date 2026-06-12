@@ -10,7 +10,7 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -46,9 +46,15 @@ Docs: https://github.com/HimanshuKanwar2001/claude-browser-bridge
 
 async function init() {
   const extPath = args[args.indexOf("init") + 1] || null;
-  const token = randomBytes(24).toString("hex");
   const os = await import("node:os");
   const home = os.homedir();
+  const port = process.env.BRIDGE_PORT || "8787";
+
+  // Use deterministic token by default (same every time on this machine)
+  const useRandom = args.includes("--random");
+  const token = useRandom
+    ? randomBytes(24).toString("hex")
+    : createHash("sha256").update(`claude-browser-bridge:${os.userInfo().username}@${os.hostname()}:${port}`).digest("hex");
 
   // Write to canonical path: ~/.claude/browser-bridge-token
   const claudeDir = join(home, ".claude");

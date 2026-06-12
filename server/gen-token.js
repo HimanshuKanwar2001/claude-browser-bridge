@@ -1,16 +1,25 @@
-// Generates the shared secret used to authenticate the extension to the bridge.
-// Writes to THREE locations so the token works regardless of install method:
-//   1. ~/.claude/browser-bridge-token  (canonical — works with global npm install)
-//   2. server/.bridge-token            (legacy — works with cloned repo)
-//   3. extension/config.js             (embedded in the Chrome extension)
+// Generates the auth token for the browser bridge.
+// By default uses a deterministic token derived from the machine identity
+// (username + hostname) so it's always the same — no sync issues.
+// Pass --random for a cryptographically random token instead.
 
-import { randomBytes } from "node:crypto";
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { homedir, hostname, userInfo } from "node:os";
 
-const token = randomBytes(24).toString("hex");
+const PORT = Number(process.env.BRIDGE_PORT) || 8787;
+const useRandom = process.argv.includes("--random");
+
+let token;
+if (useRandom) {
+  token = randomBytes(24).toString("hex");
+  console.log("Generated random token (unique, not machine-derived)");
+} else {
+  const identity = `claude-browser-bridge:${userInfo().username}@${hostname()}:${PORT}`;
+  token = createHash("sha256").update(identity).digest("hex");
+  console.log("Generated deterministic token (same every time on this machine)");
+}
 
 // 1. Write to ~/.claude/browser-bridge-token (canonical path)
 const claudeDir = join(homedir(), ".claude");
@@ -19,15 +28,13 @@ const canonicalPath = join(claudeDir, "browser-bridge-token");
 writeFileSync(canonicalPath, token + "\n");
 console.log(`✓ Token written to ${canonicalPath}`);
 
-// 2. Write to server/.bridge-token (legacy, for local repo use)
+// 2. Write to server/.bridge-token (legacy fallback)
 try {
   writeFileSync(new URL("./.bridge-token", import.meta.url), token + "\n");
   console.log("✓ Token written to server/.bridge-token");
-} catch {
-  // May fail if running from global install (read-only node_modules)
-}
+} catch {}
 
-// 3. Write extension/config.js (search multiple locations)
+// 3. Write extension/config.js
 const searchPaths = [
   new URL("../extension/config.js", import.meta.url).pathname,
   join(process.cwd(), "extension", "config.js"),
@@ -48,4 +55,4 @@ if (!extensionWritten) {
   console.log(`  const BRIDGE_TOKEN = "${token}";`);
 }
 
-console.log("\n✓ Token generated. Reload the extension in chrome://extensions to apply.");
+console.log("\n✓ Done. Reload the extension in chrome://extensions to apply.");
