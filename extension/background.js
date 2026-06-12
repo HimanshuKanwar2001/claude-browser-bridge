@@ -94,9 +94,17 @@ const debuggerTabs = new Set(); // F3 FIX: tracks tabs with debugger attached
 
 // F3 FIX: safe debugger attach/detach that tracks state
 async function safeDebuggerAttach(tabId) {
-  if (debuggerTabs.has(tabId)) return; // already attached
-  await chrome.debugger.attach({ tabId }, "1.3");
-  debuggerTabs.add(tabId);
+  if (debuggerTabs.has(tabId)) return;
+  try {
+    await chrome.debugger.attach({ tabId }, "1.3");
+    debuggerTabs.add(tabId);
+  } catch (e) {
+    if (String(e?.message || e).includes("Already attached")) {
+      debuggerTabs.add(tabId); // sync our tracking with reality
+    } else {
+      throw e;
+    }
+  }
 }
 async function safeDebuggerDetach(tabId) {
   if (!debuggerTabs.has(tabId)) return;
