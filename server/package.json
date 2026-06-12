@@ -1,8 +1,40 @@
 {
-  "name": "claude-browser-bridge-server",
-  "version": "0.1.0",
+  "name": "claude-browser-bridge",
+  "version": "3.0.0",
+  "description": "Connect your live Chrome tabs to Claude Code — 57 tools for debugging, performance, accessibility, device emulation, and browser automation.",
   "type": "module",
-  "private": true,
+  "bin": {
+    "claude-browser-bridge": "./bin/cli.js"
+  },
+  "main": "./index.js",
+  "files": [
+    "bin/",
+    "index.js",
+    "gen-token.js",
+    "README.md"
+  ],
+  "keywords": [
+    "claude-code",
+    "mcp",
+    "browser",
+    "chrome",
+    "devtools",
+    "debugging",
+    "automation",
+    "model-context-protocol",
+    "anthropic",
+    "claude"
+  ],
+  "author": "Himanshu Kanwar <himanshukanwar2001@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HimanshuKanwar2001/claude-browser-bridge"
+  },
+  "homepage": "https://github.com/HimanshuKanwar2001/claude-browser-bridge#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "ws": "^8.18.0"
