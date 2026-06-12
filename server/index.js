@@ -220,15 +220,17 @@ establish();
 const HELP_TOOL = {
   name: "browser_bridge_help",
   description:
-    "Returns the complete usage guide for all 57 browser-bridge tools. Call this ONCE at the start of any session where you need to use browser tools, to learn the optimal workflows and avoid slow anti-patterns.",
+    "Returns the complete usage guide for all 65 browser-bridge tools. Call this ONCE at the start of any session where you need to use browser tools, to learn the optimal workflows and avoid slow anti-patterns.",
   inputSchema: { type: "object", properties: {} },
 };
 
-const HELP_TEXT = `# Claude Browser Bridge — 58 Tools
+const HELP_TEXT = `# Claude Browser Bridge — 65 Tools
 
 ## WHICH TOOL FIRST? (decision tree)
 - Investigating a bug → diagnose (gives snapshot + errors + network + API responses in ONE call)
 - Fixing CSS/visual → batch([screenshot, get_styles({selector:".target"}), get_html({selector:".target"})])
+- Debugging image layers/z-index → batch([get_element_rect({selector:".container", include_children:true}), annotate({annotations:[...]})])
+- Checking pixel colors on images → inspect_pixel({selector:"img", x:50, y:50, percent:true})
 - Performance check → batch([performance_trace, get_load_timeline, heap_snapshot_summary])
 - Accessibility audit → batch([get_accessibility_tree, check_contrast({selector:".text"})])
 - Reading page content → eval (specific data) or get_page_text (all text)
@@ -274,7 +276,19 @@ Regression Testing:
 Before/After Comparison:
   screenshot (save dataUrl) → make changes → visual_diff({before_dataUrl:"..."})
 
-## ALL 58 TOOLS BY CATEGORY:
+Image/Layer Debugging:
+  annotate({annotations:[{selector:".base",label:"Base",color:"red"},{selector:".overlay",label:"Overlay",color:"blue"}]}) → screenshot → clear_annotations
+  inspect_pixel({selector:".garment-img", x:50, y:30, percent:true}) → check if transparent or opaque
+  get_element_rect({selector:".container", include_children:true}) → see all child positions + z-indexes
+  capture_canvas({selector:".composer"}) → flatten all stacked images into one PNG
+
+Cross-Product Comparison:
+  new_tab({url:"product-A"}) → new_tab({url:"product-B"}) → compare_tabs({tab_id_1:A, tab_id_2:B})
+
+State Management Testing:
+  set_storage({key:"cache", action:"remove"}) → reload → verify fresh state
+
+## ALL 65 TOOLS BY CATEGORY:
 Core: diagnose, batch, select_tab, snapshot, eval, screenshot, full_page_screenshot, get_page_text, get_html, get_page_info, browser_bridge_help
 Interaction: click, fill, hover, scroll, press_key, select_option, upload_file, highlight_element
 Navigation: navigate, new_tab, close_tab, go_back, go_forward, reload, list_tabs, wait_for
@@ -284,6 +298,8 @@ Accessibility: get_accessibility_tree, check_contrast
 Emulation: emulate_device, network_throttle, set_geolocation, toggle_dark_mode
 Testing: visual_diff, inject_css, mock_network, record_actions, replay_actions, handle_dialog
 Productivity: save_form_profile, load_form_profile, save_tab_session, restore_tab_session, edit_cookie, export_pdf
+Visual Debugging: inspect_pixel, get_element_rect, compare_tabs, annotate, clear_annotations, capture_canvas
+Storage: set_storage
 `;
 
 const BATCH_TOOL = {
