@@ -157,6 +157,45 @@ batch([performance_trace, get_load_timeline, heap_snapshot_summary])
 3. diagnose → verify behavior with clean state
 ```
 
+### Workflow: Clear All Session State Before Testing
+
+When debugging requires a clean slate (stale cache, old form data, leaked state from previous sessions):
+
+```
+1. eval({code: "(() => { sessionStorage.clear(); const keys = []; for (let i = localStorage.length-1; i>=0; i--) { const k = localStorage.key(i); if (k.includes('session') || k.includes('cache') || k.includes('config')) { keys.push(k); localStorage.removeItem(k); } } return 'Cleared: ' + keys.join(', '); })()"})
+2. reload({bypass_cache: true})
+3. diagnose → verify clean state
+```
+
+### Workflow: Multi-Page Spot Check
+
+When you need to verify the same feature across multiple products/pages/routes:
+
+```
+1. Gather your URLs (product variants, different routes, staging vs prod)
+2. For each URL:
+   a. new_tab({url}) → wait_for({selector:"main"})
+   b. Run the test actions (click, fill, scroll)
+   c. screenshot → save for comparison
+   d. get_page_info → check for errors
+   e. close_tab
+3. Compare screenshots across pages
+```
+
+### Workflow: Verify Visual Changes After Code Edits
+
+After editing CSS, coordinates, layout, or any visual property:
+
+```
+1. screenshot → save the dataUrl as "before"
+2. Make the code change → wait for HMR rebuild (2-3 seconds)
+3. visual_diff({before_dataUrl: savedDataUrl})
+   → Returns diff %, pixel count, and highlighted diff image
+4. If diff is 0% → change didn't take effect (check the selector/file)
+5. If diff is <1% → likely a small positioning adjustment (correct)
+6. If diff is >10% → something major moved (review carefully)
+```
+
 ### Tool Reference (65 tools)
 
 | When you need to... | Use this |
