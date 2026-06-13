@@ -41,3 +41,27 @@ Patterns from past debugging sessions. Read this BEFORE investigating new bugs �
 **Symptoms:** `ChunkLoadError` + unhandled promise rejection after dev server rebuilds.
 **Root cause:** Stale hot-update chunk hash — page was loaded before the rebuild.
 **Fix:** Hard reload (Cmd+Shift+R), or add HMR error boundary: `module.hot?.accept(err => window.location.reload())`.
+
+## Pattern: Stale session state bleeding across products
+**Symptoms:** Wrong values appearing (e.g. threadColor: 'dtm' on a product that doesn't support DTM, old embroidery text persisting, cached config from a different product).
+**Root cause:** sessionStorage/localStorage caching values keyed by session or product slug, not cleared between product switches.
+**How we found it:** Comparing `eval` output of stored state with the expected API response for the current product.
+**Fix:** Before testing, clear session state: `eval({code: "(() => { ['session','customiz','cache','config','embroidery','garment'].forEach(pattern => { for(let i=localStorage.length-1;i>=0;i--) { const k=localStorage.key(i); if(k.includes(pattern)) localStorage.removeItem(k); } }); sessionStorage.clear(); return 'cleared'; })()"})` then `reload({bypass_cache:true})`.
+
+## Pattern: React state inaccessible (minified class names on prod)
+**Symptoms:** Can't read component state via DOM class names or data attributes — everything is minified (single letters, hashes).
+**Root cause:** Production builds minify CSS class names and strip React DevTools hooks.
+**How we found it:** `get_styles` returned hashed class names, `eval` fiber walking returned undefined.
+**Fix:** Don't rely on class names. Use `get_element_rect({include_children:true})` for layout state, `get_styles` for computed visual state, `eval` with `document.querySelector('[data-testid]')` for test IDs, or read from the app's global store (`window.fpi`, Redux devtools, etc.).
+
+## Pattern: FDK login expired silently
+**Symptoms:** Local dev server returns blank/empty page, no errors in console. API calls return empty `{}` or redirect to login.
+**Root cause:** FDK auth token expired (typically after 24h). The dev server doesn't surface auth errors visually.
+**How we found it:** `get_network` showed API calls returning empty responses or redirects. `eval({code:"document.cookie"})` showed missing/expired session cookies.
+**Fix:** Run `fdk login --host <platform-host>` to re-authenticate. Add a session-start health check: `eval({code: "fetch('/api/service/application/user/authentication/v1.0/session').then(r=>r.json()).then(d=>JSON.stringify(d))"})` — if it returns `{authenticated:false}`, re-login.
+
+## Pattern: Visual change not visible after code edit
+**Symptoms:** Made a CSS/coordinate change but screenshot shows no difference.
+**Root cause:** Either HMR hasn't rebuilt yet, the change targets the wrong selector/element, or the CSS is being overridden by a more specific rule.
+**How we found it:** `visual_diff` returned 0% diff. Then `get_styles` on the target showed the old value — change wasn't applied.
+**Fix:** 1) Wait 3s for HMR. 2) Use `inject_css` to test the change live. 3) Use `get_styles` to verify the computed value actually changed. 4) If still unchanged, check specificity with `get_html` to see if a parent or sibling overrides.
