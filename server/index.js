@@ -317,8 +317,15 @@ Cross-Product Comparison:
 State Management Testing:
   set_storage({key:"cache", action:"remove"}) → reload → verify fresh state
 
-## ALL 65 TOOLS BY CATEGORY:
-Core: diagnose, batch, select_tab, snapshot, eval, screenshot, full_page_screenshot, get_page_text, get_html, get_page_info, browser_bridge_help
+## COMMON BUG PATTERNS (check these before investigating):
+- Stale session: clear with eval({code:"sessionStorage.clear();['session','cache','config'].forEach(p=>{for(let i=localStorage.length-1;i>=0;i--){const k=localStorage.key(i);if(k.includes(p))localStorage.removeItem(k)}})"}) + reload
+- React state unreadable (prod): don't rely on class names. Use get_styles, get_element_rect, eval with data-testid or global store
+- Login expired: get_network shows empty/{} responses → re-authenticate with the platform CLI
+- Visual change not visible: wait 3s for HMR, use inject_css to test live, get_styles to verify computed value
+- Font/asset mismatch: get_grouped_console → look for repeated warnings with API vs resolved values
+
+## ALL 66 TOOLS BY CATEGORY:
+Core: diagnose, batch, select_tab, snapshot, eval, screenshot, full_page_screenshot, get_page_text, get_html, get_page_info, browser_bridge_help, observe_mode
 Interaction: click, fill, hover, scroll, press_key, select_option, upload_file, highlight_element
 Navigation: navigate, new_tab, close_tab, go_back, go_forward, reload, list_tabs, wait_for
 Debugging: get_console, get_grouped_console, get_network, search_network_bodies, get_styles, get_cookies, get_storage, get_clipboard, watch_dom_changes, generate_selector
@@ -327,6 +334,8 @@ Accessibility: get_accessibility_tree, check_contrast
 Emulation: emulate_device, network_throttle, set_geolocation, toggle_dark_mode
 Testing: visual_diff, inject_css, mock_network, record_actions, replay_actions, handle_dialog
 Productivity: save_form_profile, load_form_profile, save_tab_session, restore_tab_session, edit_cookie, export_pdf
+Visual Debugging: inspect_pixel, get_element_rect, compare_tabs, annotate, clear_annotations, capture_canvas
+Storage: set_storage
 Visual Debugging: inspect_pixel, get_element_rect, compare_tabs, annotate, clear_annotations, capture_canvas
 Storage: set_storage
 `;
