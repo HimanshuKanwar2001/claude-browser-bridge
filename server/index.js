@@ -248,11 +248,11 @@ establish();
 const HELP_TOOL = {
   name: "browser_bridge_help",
   description:
-    "Returns the complete usage guide for all 65 browser-bridge tools. Call this ONCE at the start of any session where you need to use browser tools, to learn the optimal workflows and avoid slow anti-patterns.",
+    "Returns the complete usage guide for all 72 browser-bridge tools. Call this ONCE at the start of any session where you need to use browser tools, to learn the optimal workflows and avoid slow anti-patterns.",
   inputSchema: { type: "object", properties: {} },
 };
 
-const HELP_TEXT = `# Claude Browser Bridge — 65 Tools
+const HELP_TEXT = `# Claude Browser Bridge — 72 Tools
 
 ## WHICH TOOL FIRST? (decision tree)
 - Investigating a bug → diagnose (gives snapshot + errors + network + API responses in ONE call)
@@ -324,7 +324,7 @@ State Management Testing:
 - Visual change not visible: wait 3s for HMR, use inject_css to test live, get_styles to verify computed value
 - Font/asset mismatch: get_grouped_console → look for repeated warnings with API vs resolved values
 
-## ALL 66 TOOLS BY CATEGORY:
+## ALL 72 TOOLS BY CATEGORY:
 Core: diagnose, batch, select_tab, snapshot, eval, screenshot, full_page_screenshot, get_page_text, get_html, get_page_info, browser_bridge_help, observe_mode
 Interaction: click, fill, hover, scroll, press_key, select_option, upload_file, highlight_element
 Navigation: navigate, new_tab, close_tab, go_back, go_forward, reload, list_tabs, wait_for
@@ -336,8 +336,14 @@ Testing: visual_diff, inject_css, mock_network, record_actions, replay_actions, 
 Productivity: save_form_profile, load_form_profile, save_tab_session, restore_tab_session, edit_cookie, export_pdf
 Visual Debugging: inspect_pixel, get_element_rect, compare_tabs, annotate, clear_annotations, capture_canvas
 Storage: set_storage
-Visual Debugging: inspect_pixel, get_element_rect, compare_tabs, annotate, clear_annotations, capture_canvas
-Storage: set_storage
+Video: video_get_captions, video_control, video_capture_frame, video_get_chapters, video_listen, video_smart_read
+
+## VIDEO LEARNING WORKFLOW:
+For YouTube: use youtube-transcript MCP (get_timed_transcript) for full transcript + video_capture_frame to see code/slides.
+For non-YouTube HTML5 video: use video_get_captions or video_smart_read (auto-detects captions, falls back to speech recognition).
+video_capture_frame({timestamp:120}) → Claude sees code/slides at 2:00 mark.
+video_control({action:"seek", value:600}) → jump to 10:00.
+video_get_chapters → get topic structure from description.
 `;
 
 const BATCH_TOOL = {

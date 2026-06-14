@@ -261,5 +261,10 @@ After editing CSS, coordinates, layout, or any visual property:
 | Remove labels | `clear_annotations` |
 | Flatten stacked images | `capture_canvas` (composited PNG) |
 | Write to localStorage/sessionStorage | `set_storage` |
-| Read the full usage guide | `browser_bridge_help` |
+| Get video captions (non-YouTube) | `video_get_captions` |
+| Control video playback | `video_control` (play, pause, seek, speed) |
+| Screenshot video at timestamp | `video_capture_frame` (Claude sees code/slides) |
+| Get video chapter markers | `video_get_chapters` |
+| Transcribe via speech recognition | `video_listen` (when no captions exist) |
+| Auto-read video content | `video_smart_read` (captions → speech fallback) |
 | Read the full usage guide | `browser_bridge_help` |
