@@ -1998,6 +1998,163 @@ async function handle(msg) {
       return { tab_id: tab.id, ...result };
     }
 
+    // =====================================================================
+    // Video understanding tools — read YouTube videos through the browser
+    // =====================================================================
+
+    case "video_get_captions": {
+      // Extract ALL captions/subtitles from the current YouTube video at once
+      const captions = await execInTab(
+        tab.id,
+        () => {
+          const video = document.querySelector("video");
+          if (!video) return { error: "No video element found on this page" };
+          const tracks = video.textTracks;
+          if (!tracks || tracks.length === 0) return { error: "No caption tracks available" };
+          // Find the best track (prefer English, then first available)
+          let track = null;
+          for (let i = 0; i < tracks.length; i++) {
+            if (tracks[i].language === "en" || tracks[i].kind === "captions" || tracks[i].kind === "subtitles") {
+              track = tracks[i]; break;
+            }
+          }
+          if (!track) track = tracks[0];
+          // Enable the track to load cues
+          track.mode = "showing";
+          const cues = [];
+          if (track.cues) {
+            for (let i = 0; i < Math.min(track.cues.length, 2000); i++) {
+              const c = track.cues[i];
+              cues.push({
+                start: Math.round(c.startTime * 10) / 10,
+                end: Math.round(c.endTime * 10) / 10,
+                text: c.text?.replace(/<[^>]*>/g, "").trim(),
+              });
+            }
+          }
+          track.mode = "hidden";
+          return {
+            url: location.href,
+            title: document.title,
+            language: track.language || track.label,
+            totalCues: cues.length,
+            duration: Math.round(video.duration || 0),
+            captions: cues,
+          };
+        },
+        [],
+        "MAIN"
+      );
+      if (captions?.error) throw new Error(captions.error);
+      return { tab_id: tab.id, ...captions };
+    }
+
+    case "video_control": {
+      // Control video playback: play, pause, seek to timestamp, get current state
+      const result = await execInTab(
+        tab.id,
+        (action, seekTo) => {
+          const video = document.querySelector("video");
+          if (!video) return { error: "No video element found" };
+          if (action === "play") { video.play(); return { action: "play", currentTime: video.currentTime }; }
+          if (action === "pause") { video.pause(); return { action: "pause", currentTime: video.currentTime }; }
+          if (action === "seek") { video.currentTime = seekTo; return { action: "seek", currentTime: seekTo }; }
+          if (action === "status") {
+            return {
+              currentTime: Math.round(video.currentTime * 10) / 10,
+              duration: Math.round(video.duration),
+              paused: video.paused,
+              playbackRate: video.playbackRate,
+              volume: video.volume,
+            };
+          }
+          if (action === "speed") { video.playbackRate = seekTo; return { action: "speed", playbackRate: seekTo }; }
+          return { error: "Unknown action: " + action + ". Use: play, pause, seek, status, speed" };
+        },
+        [params.action || "status", params.value || 0],
+        "MAIN"
+      );
+      if (result?.error) throw new Error(result.error);
+      return { tab_id: tab.id, ...result };
+    }
+
+    case "video_capture_frame": {
+      // Pause video at a specific timestamp and screenshot the frame
+      // This lets Claude "see" what's on screen at any point in the video
+      await execInTab(
+        tab.id,
+        (seekTo) => {
+          const video = document.querySelector("video");
+          if (!video) return false;
+          video.pause();
+          if (seekTo !== null && seekTo !== undefined) video.currentTime = seekTo;
+          return true;
+        },
+        [params.timestamp ?? null],
+        "MAIN"
+      );
+      // Wait for frame to render
+      await new Promise(r => setTimeout(r, 500));
+      // Take screenshot
+      if (!tab.active) {
+        await chrome.tabs.update(tab.id, { active: true });
+        await new Promise(r => setTimeout(r, 200));
+      }
+      if (markedTabId === tab.id) await applyMarker(tab.id, false);
+      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      if (markedTabId === tab.id) applyMarker(tab.id, true);
+      // Get current caption at this timestamp
+      const caption = await execInTab(
+        tab.id,
+        () => {
+          const video = document.querySelector("video");
+          if (!video) return null;
+          const tracks = video.textTracks;
+          for (let i = 0; i < tracks.length; i++) {
+            const t = tracks[i];
+            if (t.activeCues && t.activeCues.length > 0) {
+              return t.activeCues[0].text?.replace(/<[^>]*>/g, "").trim();
+            }
+          }
+          return null;
+        },
+        [],
+        "MAIN"
+      );
+      return { tab_id: tab.id, timestamp: params.timestamp, caption, dataUrl };
+    }
+
+    case "video_get_chapters": {
+      // Extract chapter markers from YouTube video description or progress bar
+      const chapters = await execInTab(
+        tab.id,
+        () => {
+          // Method 1: Try structured chapter data from YouTube's DOM
+          const chapterEls = document.querySelectorAll("ytd-macro-markers-list-item-renderer, [class*='chapter']");
+          if (chapterEls.length > 0) {
+            return [...chapterEls].map(el => ({
+              title: el.querySelector("#details h4, .macro-markers")?.textContent?.trim() || el.textContent?.trim().slice(0, 80),
+              time: el.querySelector("#time, .timestamp")?.textContent?.trim(),
+            })).filter(c => c.title);
+          }
+          // Method 2: Parse description for timestamp patterns (0:00, 1:23, 10:45)
+          const desc = document.querySelector("#description-inner, #description ytd-text-inline-expander, [id*=description]")?.textContent || "";
+          const lines = desc.split("\n");
+          const chapters = [];
+          for (const line of lines) {
+            const match = line.match(/(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]?\s*(.+)/);
+            if (match) {
+              chapters.push({ time: match[1], title: match[2].trim() });
+            }
+          }
+          return chapters.length > 0 ? chapters : [{ note: "No chapters found in video" }];
+        },
+        [],
+        "MAIN"
+      );
+      return { tab_id: tab.id, url: tab.url, chapters };
+    }
+
     default:
       throw new Error("Unknown method: " + msg.method);
   }

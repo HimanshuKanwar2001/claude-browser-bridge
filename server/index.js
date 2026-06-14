@@ -1023,10 +1023,45 @@ const TOOLS = [
       },
     },
   },
+  // =================== VIDEO UNDERSTANDING TOOLS ===================
+  {
+    name: "video_get_captions",
+    description: "Extract ALL captions/subtitles from the current YouTube video in one call — returns every line with start/end timestamps. Faster than watching the video. Use on any YouTube tab to get what the instructor is saying.",
+    inputSchema: { type: "object", properties: { ...TAB_ID } },
+  },
+  {
+    name: "video_control",
+    description: "Control video playback: play, pause, seek to a timestamp, change speed, or get current status. Use action='seek' with value=seconds to jump to a specific point. action='speed' with value=2 for 2x playback.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["play", "pause", "seek", "status", "speed"], description: "What to do with the video" },
+        value: { type: "number", description: "Seek target in seconds, or playback speed multiplier" },
+        ...TAB_ID,
+      },
+      required: ["action"],
+    },
+  },
+  {
+    name: "video_capture_frame",
+    description: "Pause the video at a specific timestamp and screenshot what's on screen — lets Claude 'see' code, slides, diagrams shown in the video. Also returns the caption at that moment. Pass timestamp in seconds.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timestamp: { type: "number", description: "Time in seconds to capture the frame at (e.g. 120 for 2:00)" },
+        ...TAB_ID,
+      },
+    },
+  },
+  {
+    name: "video_get_chapters",
+    description: "Extract chapter markers from a YouTube video (from the description or progress bar). Returns chapter titles with timestamps — use to navigate a tutorial by topic.",
+    inputSchema: { type: "object", properties: { ...TAB_ID } },
+  },
 ];
 
 const server = new Server(
-  { name: "browser-bridge", version: "4.0.0" },
+  { name: "browser-bridge", version: "5.0.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -1068,6 +1103,17 @@ function formatResult(name, result) {
       content: [
         { type: "text", text: `Diff: ${result.diffPercent}% changed (${result.diffPixels} pixels)` },
         { type: "image", data: diffBase64, mimeType: "image/png" },
+      ],
+    };
+  }
+  // Video frame capture: return the screenshot as an image
+  if (name === "video_capture_frame" && result?.dataUrl) {
+    const base64 = result.dataUrl.replace(/^data:image\/png;base64,/, "");
+    const { dataUrl, ...rest } = result;
+    return {
+      content: [
+        { type: "image", data: base64, mimeType: "image/png" },
+        { type: "text", text: JSON.stringify(rest, null, 2) },
       ],
     };
   }
