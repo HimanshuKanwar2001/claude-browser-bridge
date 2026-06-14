@@ -1058,6 +1058,28 @@ const TOOLS = [
     description: "Extract chapter markers from a YouTube video (from the description or progress bar). Returns chapter titles with timestamps — use to navigate a tutorial by topic.",
     inputSchema: { type: "object", properties: { ...TAB_ID } },
   },
+  {
+    name: "video_listen",
+    description: "When no captions/transcript exist: uses Chrome's built-in Speech Recognition to listen to the audio playing in the tab and transcribe it in real-time. Records for duration_ms (default 30s, max 120s). The video must be playing and unmuted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        duration_ms: { type: "number", description: "How long to listen in ms (default 30000, max 120000)" },
+        ...TAB_ID,
+      },
+    },
+  },
+  {
+    name: "video_smart_read",
+    description: "Intelligent video reader — tries captions first (instant), falls back to speech recognition if no captions exist. The 'just give me what the video says' tool. Returns full text + method used.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        listen_duration_ms: { type: "number", description: "If speech recognition is needed, how long to listen (default 60s, max 120s)" },
+        ...TAB_ID,
+      },
+    },
+  },
 ];
 
 const server = new Server(

@@ -2155,6 +2155,177 @@ async function handle(msg) {
       return { tab_id: tab.id, url: tab.url, chapters };
     }
 
+    case "video_listen": {
+      // When no transcript/captions exist: use Chrome's Web Speech API
+      // to listen to the audio playing in the tab and transcribe it live.
+      // Records for `duration_ms` (default 30s, max 120s) and returns text.
+      const duration = Math.min(params.duration_ms ?? 30000, 120000);
+      const result = await execInTab(
+        tab.id,
+        (durationMs) => {
+          return new Promise((resolve) => {
+            if (!("webkitSpeechRecognition" in window) && !("SpeechRecognition" in window)) {
+              resolve({ error: "Speech recognition not available in this browser. Use Chrome." });
+              return;
+            }
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            const recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = false;
+            recognition.lang = "en-US";
+            recognition.maxAlternatives = 1;
+            const transcript = [];
+            const startTime = Date.now();
+            recognition.onresult = (event) => {
+              for (let i = event.resultIndex; i < event.results.length; i++) {
+                if (event.results[i].isFinal) {
+                  transcript.push({
+                    text: event.results[i][0].transcript.trim(),
+                    confidence: Math.round(event.results[i][0].confidence * 100),
+                    timeOffset: Math.round((Date.now() - startTime) / 1000),
+                  });
+                }
+              }
+            };
+            recognition.onerror = (event) => {
+              if (event.error === "no-speech") return; // just silence, keep going
+              resolve({ error: "Speech recognition error: " + event.error, partialTranscript: transcript });
+            };
+            recognition.onend = () => {
+              // Restart if duration not reached (Chrome stops after ~60s of silence)
+              if (Date.now() - startTime < durationMs) {
+                try { recognition.start(); } catch {}
+              }
+            };
+            recognition.start();
+            setTimeout(() => {
+              try { recognition.stop(); } catch {}
+              resolve({
+                transcript: transcript.map(t => t.text).join(" "),
+                segments: transcript,
+                durationListened: Math.round((Date.now() - startTime) / 1000) + "s",
+                note: transcript.length === 0
+                  ? "No speech detected. Make sure the video is playing with audio unmuted."
+                  : undefined,
+              });
+            }, durationMs);
+          });
+        },
+        [duration],
+        "MAIN"
+      );
+      if (result?.error) throw new Error(result.error);
+      return { tab_id: tab.id, ...result };
+    }
+
+    case "video_smart_read": {
+      // Intelligent video reader: tries captions first, falls back to speech recognition
+      // This is the "just give me what the video says" tool
+      const captions = await execInTab(
+        tab.id,
+        () => {
+          const video = document.querySelector("video");
+          if (!video) return { hasVideo: false };
+          const tracks = video.textTracks;
+          let hasCaptions = false;
+          let captionData = [];
+          if (tracks) {
+            for (let i = 0; i < tracks.length; i++) {
+              const t = tracks[i];
+              if (t.kind === "captions" || t.kind === "subtitles") {
+                t.mode = "showing";
+                if (t.cues && t.cues.length > 0) {
+                  hasCaptions = true;
+                  for (let j = 0; j < Math.min(t.cues.length, 2000); j++) {
+                    captionData.push({
+                      start: Math.round(t.cues[j].startTime * 10) / 10,
+                      text: t.cues[j].text?.replace(/<[^>]*>/g, "").trim(),
+                    });
+                  }
+                }
+                t.mode = "hidden";
+                if (hasCaptions) break;
+              }
+            }
+          }
+          return {
+            hasVideo: true,
+            hasCaptions,
+            duration: Math.round(video.duration || 0),
+            title: document.title,
+            url: location.href,
+            captions: captionData,
+          };
+        },
+        [],
+        "MAIN"
+      );
+
+      if (!captions.hasVideo) throw new Error("No video found on this page");
+
+      if (captions.hasCaptions && captions.captions.length > 0) {
+        return {
+          tab_id: tab.id,
+          method: "captions",
+          ...captions,
+          fullText: captions.captions.map(c => c.text).join(" "),
+        };
+      }
+
+      // No captions — fall back to speech recognition
+      // Play the video and listen
+      await execInTab(tab.id, () => {
+        const v = document.querySelector("video");
+        if (v) { v.currentTime = 0; v.play(); }
+      }, [], "MAIN");
+
+      const listenDuration = Math.min(params.listen_duration_ms ?? 60000, 120000);
+      const speech = await execInTab(
+        tab.id,
+        (durationMs) => {
+          return new Promise((resolve) => {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) { resolve({ error: "No speech recognition" }); return; }
+            const recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = false;
+            recognition.lang = "en-US";
+            const transcript = [];
+            const start = Date.now();
+            recognition.onresult = (e) => {
+              for (let i = e.resultIndex; i < e.results.length; i++) {
+                if (e.results[i].isFinal) transcript.push(e.results[i][0].transcript.trim());
+              }
+            };
+            recognition.onend = () => { if (Date.now() - start < durationMs) try { recognition.start(); } catch {} };
+            recognition.onerror = () => {};
+            recognition.start();
+            setTimeout(() => {
+              try { recognition.stop(); } catch {}
+              const v = document.querySelector("video");
+              if (v) v.pause();
+              resolve({ transcript: transcript.join(" "), segments: transcript.length });
+            }, durationMs);
+          });
+        },
+        [listenDuration],
+        "MAIN"
+      );
+
+      return {
+        tab_id: tab.id,
+        method: "speech_recognition",
+        title: captions.title,
+        url: captions.url,
+        duration: captions.duration,
+        fullText: speech.transcript || "",
+        segmentCount: speech.segments || 0,
+        note: !speech.transcript
+          ? "No speech detected. The video may need to be unmuted, or it may not have spoken content."
+          : "Transcribed via Chrome Speech Recognition (may have minor inaccuracies).",
+      };
+    }
+
     default:
       throw new Error("Unknown method: " + msg.method);
   }
