@@ -1,8 +1,10 @@
 # Global Instructions
 
-## Browser Bridge (browser-bridge MCP — 58 tools)
+## Browser Bridge (browser-bridge MCP — 74 tools)
 
 The `browser-bridge` MCP connects to the user's real Chrome browser via an extension. ALL browser operations MUST use these tools — never use WebFetch, curl, or other workarounds.
+
+**Reference files**: `INVESTIGATION-PLAYBOOK.md` for systematic investigation approaches (bugs, security, performance, accessibility). `CHROME-KNOWLEDGE.md` for Chrome internals reference. `bug-playbook.md` for known patterns from past debugging.
 
 ### Decision Tree: Which tool first?
 
@@ -268,3 +270,231 @@ After editing CSS, coordinates, layout, or any visual property:
 | Transcribe via speech recognition | `video_listen` (when no captions exist) |
 | Auto-read video content | `video_smart_read` (captions → speech fallback) |
 | Read the full usage guide | `browser_bridge_help` |
+
+---
+
+### Chrome Edge Cases — Know Before You Hit Them
+
+#### CSP & Trusted Types: When `eval` Won't Work
+
+**Major sites that block eval:** GitHub, YouTube, MDN, CodePen, Google properties, and most modern production sites.
+
+```
+eval fails with CSP/Trusted Types error?
+├── DON'T retry eval — it will ALWAYS fail on that page
+├── For reading state → use get_html + get_styles + get_page_text
+├── For finding elements → use snapshot (always works)
+├── For interacting → use click/fill/hover with refs (always works)
+├── For debugging → use get_console + get_network (always works)
+├── For screenshots → use screenshot (always works)
+└── For complex queries → combine get_html(selector) + get_styles(selector)
+```
+
+**What ALWAYS works on every site (CSP-immune):**
+`snapshot`, `click`, `fill`, `hover`, `scroll`, `press_key`, `select_option`,
+`get_html`, `get_styles`, `get_page_text`, `get_page_info`, `screenshot`,
+`get_console`, `get_network`, `get_element_rect`, `get_cookies`, `get_storage`,
+`wait_for`, `diagnose`, `highlight_element`, `annotate`, `inject_css`
+
+**What fails on CSP-strict sites:** `eval` only.
+
+#### Pages You CANNOT Access At All
+
+```
+chrome:// pages → ALL tools blocked (settings, extensions, flags, newtab)
+chrome-extension:// → blocked (other extensions' pages)
+Chrome Web Store → blocked
+devtools:// → blocked
+view-source: → blocked
+```
+
+`list_tabs` can see these tabs exist (title + URL) but cannot interact. Don't waste time trying.
+
+#### Debugger Conflict: Never Batch These Together
+
+These tools all use `chrome.debugger` — only ONE can run at a time per tab:
+
+```
+DEBUGGER TOOLS (never batch two of these together):
+  performance_trace, get_accessibility_tree, heap_snapshot_summary,
+  mock_network, emulate_device, network_throttle, upload_file,
+  check_contrast (sometimes), screenshot (CDP mode)
+
+BAD:  batch([performance_trace, get_accessibility_tree])  → second one FAILS
+GOOD: performance_trace first → then get_accessibility_tree separately
+SAFE TO BATCH: batch([screenshot, get_styles, get_html, eval, get_console])
+```
+
+#### Shadow DOM: How to Reach Inside Web Components
+
+YouTube, GitHub, and modern component libraries use Shadow DOM. Elements inside shadow roots may not appear in `snapshot` or `get_html`.
+
+```
+1. Check for shadow roots: 
+   eval: document.querySelectorAll('*').forEach(el => { if(el.shadowRoot) ... })
+
+2. Query inside open shadow roots:
+   eval: document.querySelector('my-component').shadowRoot.querySelector('.target')
+
+3. snapshot DOES find interactive elements (buttons/inputs) inside open shadow roots
+   — they get refs and click/fill works
+
+4. Closed shadow roots (mode: "closed") → NOT accessible. Very rare.
+```
+
+#### Cross-Origin Iframes: What You Can and Can't Do
+
+```
+CAN do:
+  - Detect iframes exist: eval("document.querySelectorAll('iframe').length")
+  - See iframe position/size: get_element_rect({selector: "iframe"})
+  - Screenshot captures iframes visually (they're rendered in viewport)
+
+CANNOT do:
+  - Read/modify content inside cross-origin iframes via eval
+  - Get elements inside ad iframes, payment frames (Stripe), social widgets
+
+Affected: Ad iframes, payment forms, social embeds, embedded videos
+```
+
+#### check_contrast: Transparent Background False Positives
+
+When `check_contrast` returns ratio ~1.0 with `bg: rgba(0, 0, 0, 0)`:
+```
+The element has transparent background — contrast tool doesn't walk up parents.
+Fix: Use get_styles on parent elements to find actual background, or
+     use inspect_pixel at the text location for the real rendered color.
+```
+
+#### Tab Discarding: Lost Buffer History
+
+Chrome kills background tabs under memory pressure. All `__claudeBridge` buffers (logs, requests) are lost. When refocused, tab reloads fresh.
+```
+If a background tab has empty console/network history:
+1. It was likely discarded by Chrome
+2. Accept history is gone — start fresh
+3. Use diagnose to establish current state
+4. Use get_console({clear: true}) to mark a clean starting point
+```
+
+#### After Back/Forward Navigation (bfcache)
+
+```
+After browser back/forward:
+1. ALWAYS take fresh snapshot before using refs (old refs are stale)
+2. Use get_console({clear: true}) to reset stale log buffer
+3. Use diagnose (gives fresh snapshot automatically)
+```
+
+### Workflow: Investigating a CSP-Strict Site (GitHub, YouTube, etc.)
+
+When eval is blocked, use this complete alternative workflow:
+
+```
+1. diagnose → snapshot + console errors + network failures (all work)
+
+2. For DOM structure: get_html({selector: ".target"})
+   For CSS values: get_styles({selector: ".target"})
+   For text content: get_page_text
+   For element geometry: get_element_rect({selector: ".target"})
+
+3. For interaction: use refs from snapshot
+   click({ref: "ref_5"}) → wait_for({text: "Expected"}) → screenshot
+
+4. For debugging: get_console + get_network({url_contains: "/api/"})
+   For searching API responses: search_network_bodies({query: "error"})
+
+5. For CSS testing: inject_css({css: ".fix { color: red }"}) → screenshot
+```
+
+### Workflow: Debugging Shadow DOM Components
+
+```
+1. diagnose → check if snapshot found the elements you expect
+
+2. If elements are missing from snapshot:
+   get_html({selector: "the-component"}) → check if it's a custom element
+
+3. On eval-friendly sites, traverse shadow DOM:
+   eval: document.querySelector('my-el').shadowRoot.innerHTML
+
+4. On CSP-strict sites (eval blocked):
+   get_html gives you the custom element's outer HTML
+   get_styles gives you computed styles on the host element
+   snapshot still finds interactive elements inside open shadow roots
+   click/fill refs work for buttons/inputs inside shadow DOM
+
+5. screenshot to visually verify what the shadow content looks like
+```
+
+### Workflow: Performance Audit (Debugger-Safe)
+
+```
+DON'T: batch([performance_trace, get_accessibility_tree, heap_snapshot_summary])
+       → debugger conflicts will cause failures
+
+DO: Run them in sequence:
+1. performance_trace → Web Vitals (LCP, FCP, CLS) + CDP metrics
+2. get_accessibility_tree → a11y tree (after performance detaches)
+3. heap_snapshot_summary → memory usage (after a11y detaches)
+4. get_load_timeline → resource waterfall (no debugger needed, safe to batch)
+
+SAFE BATCH: batch([performance_trace, get_load_timeline])
+            (only performance_trace uses debugger here)
+```
+
+### Investigation Quick Reference (Full playbook: INVESTIGATION-PLAYBOOK.md)
+
+#### Which approach for which problem?
+
+```
+Visual bug?
+├── Quick: batch([screenshot, get_styles({selector:".broken"})])
+├── Standard: inject_css → screenshot loop (test fixes live)
+└── Deep: annotate layers + get_element_rect({include_children:true}) + visual_diff
+
+Broken feature?
+├── Quick: diagnose (check consoleErrors + failedRequests)
+├── Standard: click/fill → get_console → get_network (trace the action)
+└── Deep: record_actions → replay → state tracking with eval
+
+Security check?
+├── Quick: get_cookies (check HttpOnly/Secure/SameSite flags)
+├── Standard: get_network (tokens in URLs?) + get_html (reflected input?)
+├── Deep: Full audit — cookie flags + storage audit + API exposure + CORS + mixed content
+
+Slow page?
+├── Quick: performance_trace (Web Vitals in one call)
+├── Standard: + get_load_timeline (resource waterfall)
+└── Deep: network_throttle("slow-3g") → reload → performance_trace
+
+A11y audit?
+├── Quick: get_accessibility_tree
+├── Standard: + check_contrast on key text elements
+└── Deep: keyboard nav test (press_key Tab loop) + full a11y tree review
+
+Wrong data?
+├── Quick: get_network({url_contains:"/api/"})
+├── Standard: search_network_bodies({query:"the wrong value"})
+└── Deep: Storage audit + eval state inspection + clean slate test
+
+API failure?
+├── Quick: diagnose (failedRequests with response bodies)
+├── Standard: get_network({only_failures:true}) + search_network_bodies
+└── Deep: mock_network for error state testing + empty state testing
+```
+
+#### Security Testing Checklist (via bridge)
+
+```
+1. COOKIES:    get_cookies → check HttpOnly, Secure, SameSite, expiration
+2. TOKENS:     get_network → tokens in URLs? search_network_bodies("token")
+3. XSS:        fill({value:"<script>..."}) → get_html → check if reflected unescaped
+4. DATA LEAK:  get_html → hidden fields, comments, JSON-LD with sensitive data
+5. API OVER-FETCH: get_network → do responses contain more fields than UI shows?
+6. MIXED:      get_network → any http:// requests on https:// page?
+7. CSP:        diagnose → cspBlocksEval? (if false = weaker XSS protection)
+8. SOURCE MAPS: eval("fetch(scriptSrc+'.map')...") → exposed source code?
+9. STORAGE:    get_storage → tokens in localStorage? (vulnerable to XSS)
+10. CORS:      get_network → Access-Control-Allow-Origin: * with credentials?
+```

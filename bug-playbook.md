@@ -65,3 +65,119 @@ Patterns from past debugging sessions. Read this BEFORE investigating new bugs �
 **Root cause:** Either HMR hasn't rebuilt yet, the change targets the wrong selector/element, or the CSS is being overridden by a more specific rule.
 **How we found it:** `visual_diff` returned 0% diff. Then `get_styles` on the target showed the old value — change wasn't applied.
 **Fix:** 1) Wait 3s for HMR. 2) Use `inject_css` to test the change live. 3) Use `get_styles` to verify the computed value actually changed. 4) If still unchanged, check specificity with `get_html` to see if a parent or sibling overrides.
+
+---
+
+# Chrome Edge Cases & Bridge Limitations
+
+## Pattern: eval blocked by CSP (Content Security Policy)
+**Symptoms:** `eval` returns `EvalError: Evaluating a string as JavaScript violates the following Content Security Policy directive because 'unsafe-eval' is not an allowed source of script`.
+**Affected sites:** GitHub, YouTube, MDN, CodePen, and most modern production sites.
+**Root cause:** The site's CSP header includes `script-src` without `'unsafe-eval'`. Our `eval` tool uses `chrome.scripting.executeScript` in MAIN world which then calls `eval()` — the page's CSP blocks that call at the V8 engine level.
+**What still works:** `snapshot`, `click`, `fill`, `hover`, `get_html`, `get_styles`, `get_console`, `get_network`, `screenshot`, `get_element_rect`, `get_page_text` — all of these use function references (not string eval) and work on every site.
+**Workarounds:**
+1. Use `get_html` + `get_styles` to read DOM/CSS state instead of eval
+2. Use `snapshot` to find interactive elements and their refs
+3. Use `get_console` and `get_network` for debugging data
+4. Use `get_page_text` to read visible page content
+5. Combine `click`/`fill` with `wait_for` for interaction testing
+**How to detect:** If eval fails with "Content Security Policy" in the error, switch to the alternatives above. Do NOT retry eval — it will fail every time on that page.
+
+## Pattern: eval blocked by Trusted Types
+**Symptoms:** `eval` returns `EvalError: Evaluating a string as JavaScript violates this document's Trusted Type assignment requirements`.
+**Affected sites:** YouTube, Google properties, modern SPAs using Trusted Types API.
+**Root cause:** Trusted Types is a stricter variant of CSP that blocks `eval()`, `innerHTML` assignments, and `document.write()` with untrusted strings. Same fundamental issue as CSP eval blocking.
+**What still works:** Same as CSP — all tools except `eval`.
+**Workarounds:** Same as CSP pattern above.
+**How to detect:** If eval fails with "Trusted Type" in the error, same behavior as CSP — switch to alternatives.
+
+## Pattern: chrome:// pages completely inaccessible
+**Symptoms:** All tools fail. `eval` and `snapshot` return "Cannot access a chrome:// URL". `screenshot` returns "The 'activeTab' permission is not in effect".
+**Affected pages:** `chrome://settings`, `chrome://extensions`, `chrome://flags`, `chrome://version`, `chrome://newtab`, all `chrome://` URLs.
+**Root cause:** Chrome blocks ALL extension access to chrome:// URLs by design. No permissions, manifest changes, or workarounds can bypass this — it's a hard security boundary in the browser.
+**What still works:** Nothing. `list_tabs` can see the tab exists (title + URL) but cannot interact with it.
+**Workaround:** If you need information from a chrome:// page (e.g., Chrome version), use alternative approaches like `navigator.userAgent` via eval on a regular page, or `chrome.runtime.getManifest()` for extension info.
+
+## Pattern: Debugger conflict in batch calls
+**Symptoms:** One tool in a `batch` call succeeds, another fails with "Another debugger is already attached to the tab with id: XXXXX".
+**Affected tools:** Any two tools that use `chrome.debugger` when run in the same batch: `performance_trace`, `get_accessibility_tree`, `heap_snapshot_summary`, `screenshot` (CDP mode), `mock_network`, `emulate_device`, `network_throttle`, `check_contrast`, `upload_file`.
+**Root cause:** Chrome only allows ONE `chrome.debugger` attachment per tab at a time. When two debugger-dependent tools run concurrently in a batch, the second one can't attach.
+**Fix:** Don't batch debugger-dependent tools together. Run them sequentially:
+```
+// BAD: batch([performance_trace, get_accessibility_tree])
+// GOOD: performance_trace first, then get_accessibility_tree separately
+```
+**How to detect:** If a batch call returns "Another debugger is already attached", split the failing tool into a separate call.
+
+## Pattern: check_contrast reports FAIL on transparent backgrounds
+**Symptoms:** `check_contrast` returns contrast ratio ~1.0 and FAIL for WCAG AA/AAA, even though text is visually readable.
+**Root cause:** The tool reads the element's direct `background-color` which is `rgba(0, 0, 0, 0)` (transparent). It doesn't walk up the parent chain to find the actual visible background.
+**Example:** Wikipedia headings report contrast ratio 1.14 because the heading itself has transparent background, even though the page background is white.
+**Workaround:** When check_contrast reports a transparent background (bg contains `rgba(0, 0, 0, 0)` or `transparent`):
+1. Use `get_styles` on parent elements to find the actual background
+2. Or use `inspect_pixel` at the text location to read the actual rendered color
+3. Or use `screenshot` and visually verify contrast
+
+## Pattern: Shadow DOM traversal
+**Symptoms:** `get_html` or `snapshot` doesn't show elements inside web components. Clicking refs inside shadow DOM may fail.
+**Affected sites:** YouTube (Polymer/Lit), GitHub (web components), sites using Shoelace, Material Web, etc.
+**Root cause:** Elements inside Shadow DOM are not part of the main document's DOM tree. `document.querySelector()` can't reach them.
+**How to detect:** If a visible element isn't in the snapshot, it's likely inside a shadow root. Use eval to check:
+```
+eval: document.querySelectorAll('*').forEach(el => { if(el.shadowRoot) console.log(el.tagName) })
+```
+**Workaround (open shadow roots):**
+1. Use `eval` to traverse: `el.shadowRoot.querySelector('.target')`
+2. Use `get_html` on the custom element itself to see its outer structure
+3. `snapshot` does find interactive elements inside open shadow roots (buttons, inputs) — they get refs
+**Note:** Closed shadow roots (`mode: "closed"`) are NOT accessible via JS. Very rare in practice.
+
+## Pattern: Cross-origin iframe content inaccessible
+**Symptoms:** `eval` or `get_html` targeting content inside an iframe returns null or throws a cross-origin error.
+**Affected:** Ad iframes, payment frames (Stripe), embedded videos, social widgets (Facebook Like, Twitter embed).
+**Root cause:** Cross-origin iframes run in separate renderer processes (Site Isolation). The parent page's JS context cannot access them. Our content script in the parent frame has no reach.
+**What you CAN do:**
+1. `eval` can detect iframes exist: `document.querySelectorAll('iframe')` — get src, sandbox, dimensions
+2. `screenshot` captures the rendered iframe visually (it's in the viewport)
+3. `get_element_rect` gives the iframe's position and size
+**What you CANNOT do:** Read/modify content inside cross-origin iframes via eval from the parent frame.
+**Future fix:** Use `chrome.scripting.executeScript` with `allFrames: true` to inject into each frame independently.
+
+## Pattern: Service Worker not captured by bridge
+**Symptoms:** Network requests made by a service worker don't appear in `get_network`. Console logs from service workers don't appear in `get_console`.
+**Root cause:** Our bridge (`inject.js`) only runs in page contexts, not in service worker contexts. SWs have their own fetch/console that we don't wrap.
+**Workaround:**
+1. Check if a SW is active: `eval({code: "navigator.serviceWorker?.controller?.scriptURL"})`
+2. Use `get_network` with `only_failures: true` to see requests that failed AFTER SW interception
+3. For full SW debugging, open Chrome DevTools → Application → Service Workers
+
+## Pattern: Tab discarded by Chrome — bridge buffers lost
+**Symptoms:** After a tab has been in the background for a long time, `get_console` and `get_network` return empty arrays even though you expected history.
+**Root cause:** Chrome discards background tabs under memory pressure, killing the renderer process. All in-memory state (our `__claudeBridge.logs` and `.requests` buffers) is lost. When the tab is refocused, it reloads fresh and our content script re-injects — but history starts from zero.
+**How to detect:** If a background tab suddenly has empty buffers, it was likely discarded.
+**Workaround:** Before investigating a background tab, `diagnose` it first to establish current state. Accept that historical logs may be gone. Use `get_console({clear: true})` to mark a clean starting point.
+
+## Pattern: bfcache restores stale bridge state
+**Symptoms:** After using browser back button, `get_console` shows old logs from the previous visit. `snapshot` refs may be stale.
+**Root cause:** Back-forward cache restores the entire page state including our `__claudeBridge` object with its old buffers. The refs array points to old DOM elements that may have changed.
+**Fix:** After any back/forward navigation:
+1. Always take a fresh `snapshot` before using refs
+2. Use `get_console({clear: true})` to reset the log buffer
+3. Use `diagnose` which gives you a fresh snapshot automatically
+
+## Pattern: WebSocket traffic invisible
+**Symptoms:** A real-time app (chat, trading, notifications) is clearly receiving data but `get_network` shows nothing.
+**Root cause:** Our bridge only wraps `fetch()` and `XMLHttpRequest`. WebSocket connections and their frames are not captured.
+**Workaround:**
+1. Use `eval` to check for WS connections: `eval({code: "performance.getEntriesByType('resource').filter(r => r.name.startsWith('wss://'))"})` 
+2. For full WS inspection, the CDP `Network` domain can capture WebSocket frames (future improvement)
+3. Use `screenshot` + `get_page_text` to observe the effects of WS messages on the UI
+
+## Pattern: Large page snapshot exceeds limits
+**Symptoms:** `snapshot` or `get_html` returns truncated content or takes very long.
+**Root cause:** Pages with thousands of interactive elements (data tables, infinite scroll, complex SPAs) generate huge snapshots. HTML output is capped at 100KB.
+**Workaround:**
+1. Use `snapshot` with `max_elements` parameter to limit: `snapshot({max_elements: 50})`
+2. Use `get_html` with a specific `selector` to target just the section you need
+3. Use `eval` to query specific elements rather than dumping the whole page
+4. For infinite scroll pages, scroll to the area of interest first, then snapshot

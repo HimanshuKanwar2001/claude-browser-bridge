@@ -90,6 +90,7 @@ let targetTabId = null;
 let markedTabId = null;
 let markerGrouped = false;
 let observeMode = false; // when true, interaction tools auto-capture screenshot in response
+let cursorMode = false; // when true, visual cursor animates to targets before interactions
 const injectedTabs = new Set();
 const debuggerTabs = new Set();
 
@@ -100,8 +101,25 @@ async function safeDebuggerAttach(tabId) {
     await chrome.debugger.attach({ tabId }, "1.3");
     debuggerTabs.add(tabId);
   } catch (e) {
-    if (String(e?.message || e).includes("Already attached")) {
-      debuggerTabs.add(tabId); // sync our tracking with reality
+    const msg = String(e?.message || e);
+    if (msg.includes("Already attached")) {
+      debuggerTabs.add(tabId);
+    } else if (msg.includes("Cannot attach") || msg.includes("Cannot access")) {
+      throw new Error(
+        `Cannot attach debugger to this tab. ` +
+        `Chrome blocks debugger on chrome:// pages, the Chrome Web Store, and other protected pages. ` +
+        `Tools that need the debugger will not work here (screenshot via CDP, performance_trace, ` +
+        `get_accessibility_tree, heap_snapshot_summary, mock_network, emulate_device, upload_file). ` +
+        `Tools that DO work: snapshot, eval, get_html, get_styles, get_console, get_network, click, fill.`
+      );
+    } else if (msg.includes("Another debugger")) {
+      throw new Error(
+        `Another debugger is already attached to this tab. ` +
+        `This happens when two debugger-dependent tools run at the same time (e.g. in a batch call). ` +
+        `Debugger tools: performance_trace, get_accessibility_tree, heap_snapshot_summary, ` +
+        `mock_network, emulate_device, network_throttle, upload_file, check_contrast. ` +
+        `FIX: Run debugger tools one at a time, not in the same batch call.`
+      );
     } else {
       throw e;
     }
@@ -189,6 +207,116 @@ function pageMarker(show) {
     if (orig) orig.parentNode.appendChild(orig);
   }
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Visual cursor overlay (injected into the page via execInTab)
+// ---------------------------------------------------------------------------
+
+function pageCursorSystem(action, params) {
+  const CID = '__claude_cursor__';
+  const LID = '__claude_cursor_label__';
+  const SID = '__claude_cursor_style__';
+  const RC = '__claude_ripple__';
+  const TC = '__claude_typing_indicator__';
+
+  if (!document.getElementById(SID)) {
+    const s = document.createElement('style');
+    s.id = SID;
+    s.textContent = `
+      #${CID}{position:fixed;z-index:2147483647;pointer-events:none;width:20px;height:20px;opacity:0;
+        transition:left .35s cubic-bezier(.22,1,.36,1),top .35s cubic-bezier(.22,1,.36,1),opacity .15s;
+        filter:drop-shadow(0 1px 3px rgba(0,0,0,.3))}
+      #${LID}{position:fixed;z-index:2147483647;pointer-events:none;
+        font:600 11px/1.6 -apple-system,BlinkMacSystemFont,sans-serif;
+        background:#D97757;color:#fff;padding:2px 10px;border-radius:4px;white-space:nowrap;opacity:0;
+        transition:left .35s cubic-bezier(.22,1,.36,1),top .35s cubic-bezier(.22,1,.36,1),opacity .2s;
+        box-shadow:0 2px 8px rgba(0,0,0,.15)}
+      .${RC}{position:fixed;z-index:2147483646;pointer-events:none;width:30px;height:30px;border-radius:50%;
+        background:rgba(217,119,87,.35);transform:scale(0);animation:__cr__ .5s ease-out forwards}
+      @keyframes __cr__{0%{transform:scale(0);opacity:.6}100%{transform:scale(2.5);opacity:0}}
+      .${TC}{animation:__ct__ .8s ease-in-out infinite;outline:2px solid #D97757!important;outline-offset:2px}
+      @keyframes __ct__{0%,100%{box-shadow:0 0 0 2px rgba(217,119,87,.3)}50%{box-shadow:0 0 0 5px rgba(217,119,87,.5)}}
+      .__claude_highlight_flash__{animation:__chf__ .4s ease-out;outline:2px solid #D97757;outline-offset:2px}
+      @keyframes __chf__{0%{outline-color:rgba(217,119,87,.8);outline-width:3px}100%{outline-color:rgba(217,119,87,0);outline-width:0}}
+    `;
+    (document.head || document.documentElement).appendChild(s);
+  }
+
+  let cursor = document.getElementById(CID);
+  let label = document.getElementById(LID);
+  if (!cursor) {
+    cursor = document.createElement('div');
+    cursor.id = CID;
+    cursor.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24">' +
+      '<path d="M5.5 3.21V20.8l5.71-5.71h8.79L5.5 3.21z" fill="#D97757" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg>';
+    (document.body || document.documentElement).appendChild(cursor);
+  }
+  if (!label) {
+    label = document.createElement('div');
+    label.id = LID;
+    (document.body || document.documentElement).appendChild(label);
+  }
+
+  if (action === 'show') {
+    cursor.style.left = (params.x - 2) + 'px';
+    cursor.style.top = (params.y - 2) + 'px';
+    cursor.style.opacity = '1';
+    if (params.label) {
+      label.textContent = params.label;
+      label.style.left = (params.x + 22) + 'px';
+      label.style.top = (params.y - 6) + 'px';
+      label.style.opacity = '1';
+    }
+    return true;
+  }
+  if (action === 'move') {
+    cursor.style.opacity = '1';
+    cursor.style.left = (params.x - 2) + 'px';
+    cursor.style.top = (params.y - 2) + 'px';
+    if (params.label) {
+      label.textContent = params.label;
+      label.style.left = (params.x + 22) + 'px';
+      label.style.top = (params.y - 6) + 'px';
+      label.style.opacity = '1';
+    } else {
+      label.style.opacity = '0';
+    }
+    return true;
+  }
+  if (action === 'ripple') {
+    const r = document.createElement('div');
+    r.className = RC;
+    r.style.left = (params.x - 15) + 'px';
+    r.style.top = (params.y - 15) + 'px';
+    (document.body || document.documentElement).appendChild(r);
+    setTimeout(() => r.remove(), 600);
+    return true;
+  }
+  if (action === 'typing') {
+    if (params.el) params.el.classList.toggle(TC, params.on);
+    return true;
+  }
+  if (action === 'flash') {
+    if (params.el) {
+      params.el.classList.add('__claude_highlight_flash__');
+      setTimeout(() => params.el.classList.remove('__claude_highlight_flash__'), 500);
+    }
+    return true;
+  }
+  if (action === 'hide') {
+    cursor.style.opacity = '0';
+    label.style.opacity = '0';
+    return true;
+  }
+  if (action === 'destroy') {
+    document.getElementById(CID)?.remove();
+    document.getElementById(LID)?.remove();
+    document.querySelectorAll('.' + RC).forEach(e => e.remove());
+    document.querySelectorAll('.' + TC).forEach(e => e.classList.remove(TC));
+    return true;
+  }
+  return false;
 }
 
 async function applyMarker(tabId, show) {
@@ -288,8 +416,22 @@ function pageLocateAndAct(sel, ref, timeoutMs, action, value) {
     const attempt = () => {
       let el = null;
       let stale = false;
+      const bridge = window.__claudeBridge;
+      if (!bridge) {
+        if (Date.now() - started >= timeoutMs) {
+          resolve({ error: "Bridge not initialized — internal error, please reload the page" });
+          return;
+        }
+        setTimeout(attempt, 150);
+        return;
+      }
+
       if (ref !== null && ref !== undefined) {
-        el = window.__claudeBridge?.refs?.[ref] || null;
+        if (!bridge.refs || !Array.isArray(bridge.refs)) {
+          resolve({ error: `Bridge refs array not initialized — take a new snapshot first` });
+          return;
+        }
+        el = bridge.refs[ref] || null;
         if (el && !el.isConnected) { el = null; stale = true; }
       } else {
         el = document.querySelector(sel);
@@ -305,25 +447,71 @@ function pageLocateAndAct(sel, ref, timeoutMs, action, value) {
           });
           return;
         }
-        setTimeout(attempt, 150); // was 200 — faster polling
+        setTimeout(attempt, 150);
         return;
       }
-      // F4 FIX: catch Illegal invocation from GC'd DOM refs and translate to stale-ref message
+
+      // Actionability checks (like Playwright)
       try {
-        el.scrollIntoView({ block: "center" });
+        const cs = window.getComputedStyle(el);
+        if (cs.display === "none") {
+          if (Date.now() - started >= timeoutMs) {
+            resolve({ error: "Element is hidden (display:none) — trigger it to become visible first" });
+            return;
+          }
+          setTimeout(attempt, 200);
+          return;
+        }
+        if (cs.visibility === "hidden" || parseFloat(cs.opacity) === 0) {
+          if (Date.now() - started >= timeoutMs) {
+            resolve({ error: "Element is invisible (visibility:hidden or opacity:0)" });
+            return;
+          }
+          setTimeout(attempt, 200);
+          return;
+        }
+        if (el.disabled && action === "click") {
+          resolve({ error: "Element is disabled — cannot click" });
+          return;
+        }
+      } catch {}
+
+      try {
+        el.scrollIntoView({ block: "center", behavior: "instant" });
       } catch (scrollErr) {
         resolve({ error: ref !== null && ref !== undefined
           ? `ref_${ref} is stale (element was garbage collected) — take a new snapshot`
           : `Element no longer accessible: ${scrollErr.message}` });
         return;
       }
+
       try {
+        const rect = el.getBoundingClientRect();
+        const cx = rect.x + rect.width / 2;
+        const cy = rect.y + rect.height / 2;
+
         if (action === "click") {
-          el.click();
+          // Full realistic event sequence matching Playwright's approach:
+          // pointer events → mouse events → focus → release → click
+          const base = { bubbles: true, cancelable: true, view: window,
+            clientX: cx, clientY: cy, screenX: cx, screenY: cy, button: 0 };
+          el.dispatchEvent(new PointerEvent("pointerover", { ...base, pointerId: 1, pointerType: "mouse" }));
+          el.dispatchEvent(new MouseEvent("mouseover", base));
+          el.dispatchEvent(new PointerEvent("pointerenter", { ...base, bubbles: false, pointerId: 1, pointerType: "mouse" }));
+          el.dispatchEvent(new MouseEvent("mouseenter", { ...base, bubbles: false }));
+          el.dispatchEvent(new PointerEvent("pointermove", { ...base, pointerId: 1, pointerType: "mouse" }));
+          el.dispatchEvent(new MouseEvent("mousemove", base));
+          el.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1, pointerId: 1, pointerType: "mouse" }));
+          el.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+          if (typeof el.focus === "function") el.focus();
+          el.dispatchEvent(new PointerEvent("pointerup", { ...base, pointerId: 1, pointerType: "mouse" }));
+          el.dispatchEvent(new MouseEvent("mouseup", base));
+          el.dispatchEvent(new MouseEvent("click", base));
         } else if (el.isContentEditable) {
           el.focus();
           el.textContent = value;
-          el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
         } else {
           el.focus();
           const proto =
@@ -333,10 +521,16 @@ function pageLocateAndAct(sel, ref, timeoutMs, action, value) {
           const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
           if (setter) setter.call(el, value);
           else el.value = value;
-          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertReplacementText", data: value }));
           el.dispatchEvent(new Event("change", { bubbles: true }));
         }
-        resolve({ ok: true, waitedMs: Date.now() - started });
+        resolve({
+          ok: true,
+          waitedMs: Date.now() - started,
+          rect: { x: Math.round(rect.x), y: Math.round(rect.y),
+                  w: Math.round(rect.width), h: Math.round(rect.height),
+                  cx: Math.round(cx), cy: Math.round(cy) },
+        });
       } catch (e) {
         const msg = String(e?.message || e);
         if (msg.includes("Illegal invocation") && ref !== null && ref !== undefined) {
@@ -353,6 +547,8 @@ function pageLocateAndAct(sel, ref, timeoutMs, action, value) {
 function pageSnapshot(maxElements) {
   const bridge = window.__claudeBridge;
   if (!bridge) return null;
+  // FIX: Clear refs safely — create a new array instead of mutating in place
+  // to avoid race conditions when other tools are reading refs concurrently
   bridge.refs = [];
   const SELECTOR =
     'a[href], button, input, select, textarea, summary, ' +
@@ -444,18 +640,174 @@ function parseRef(ref) {
   return n;
 }
 
+// ---------------------------------------------------------------------------
+// CDP-level input: real isTrusted mouse/keyboard events (like Playwright)
+// ---------------------------------------------------------------------------
+
+async function cdpClick(tabId, x, y) {
+  await safeDebuggerAttach(tabId);
+  try {
+    // Move → Press → Release — the same sequence Playwright uses
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
+    });
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+      type: "mousePressed", x, y, button: "left", buttons: 1,
+      clickCount: 1, pointerType: "mouse",
+    });
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+      type: "mouseReleased", x, y, button: "left", buttons: 0,
+      clickCount: 1, pointerType: "mouse",
+    });
+  } finally {
+    await safeDebuggerDetach(tabId);
+  }
+}
+
+async function cdpType(tabId, text) {
+  await safeDebuggerAttach(tabId);
+  try {
+    for (const char of text) {
+      const code = char.charCodeAt(0);
+      if (code > 127) {
+        // Non-ASCII: use insertText (IME-style, handles emoji/unicode)
+        await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text: char });
+      } else {
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+          type: "keyDown", text: char, key: char,
+          code: char === " " ? "Space" : "Key" + char.toUpperCase(),
+          windowsVirtualKeyCode: code, nativeVirtualKeyCode: code,
+        });
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+          type: "keyUp", key: char,
+          code: char === " " ? "Space" : "Key" + char.toUpperCase(),
+          windowsVirtualKeyCode: code, nativeVirtualKeyCode: code,
+        });
+      }
+    }
+  } finally {
+    await safeDebuggerDetach(tabId);
+  }
+}
+
+async function cdpHover(tabId, x, y) {
+  await safeDebuggerAttach(tabId);
+  try {
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
+    });
+  } finally {
+    await safeDebuggerDetach(tabId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Element position helper: scrolls into view and returns center coordinates
+// ---------------------------------------------------------------------------
+
+async function getElementCenter(tabId, selector, ref) {
+  return execInTab(tabId, (sel, refIdx) => {
+    const bridge = window.__claudeBridge;
+    let el = refIdx !== null ? bridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+    if (!el || !el.isConnected) return null;
+    el.scrollIntoView({ block: "center", behavior: "instant" });
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return null;
+    return {
+      x: Math.round(r.x + r.width / 2),
+      y: Math.round(r.y + r.height / 2),
+      rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
+    };
+  }, [selector || null, ref], "MAIN");
+}
+
+// ---------------------------------------------------------------------------
+// actOnElement: orchestrates cursor animation + CDP input + visual effects
+// ---------------------------------------------------------------------------
+
 async function actOnElement(tab, params, action) {
   const ref = parseRef(params.ref);
   if (ref === null && !params.selector) throw new Error("Provide either 'selector' or 'ref'");
   if (ref !== null) await ensureRecorder(tab.id);
+
+  // Step 1: Get element position (scroll into view + get coordinates)
   const waitMs = Math.min(params.wait_ms ?? 5000, 15000);
-  const result = await execInTab(
-    tab.id, pageLocateAndAct,
-    [params.selector || null, ref, waitMs, action, params.value ?? null],
-    "MAIN"
-  );
-  if (result?.error) throw new Error(result.error);
-  const response = { [action === "click" ? "clicked" : "filled"]: params.selector || `ref_${ref}`, waitedMs: result.waitedMs };
+  const started = Date.now();
+  let pos = null;
+  while (!pos && Date.now() - started < waitMs) {
+    pos = await getElementCenter(tab.id, params.selector, ref);
+    if (!pos) await new Promise(r => setTimeout(r, 150));
+  }
+
+  // Actionability check
+  if (!pos) {
+    // Fall back to the JS-based function for better error messages
+    const result = await execInTab(tab.id, pageLocateAndAct,
+      [params.selector || null, ref, 100, action, params.value ?? null], "MAIN");
+    throw new Error(result?.error || `Element not found within ${waitMs}ms`);
+  }
+
+  // Step 2: Cursor animation (if cursor mode)
+  if (cursorMode) {
+    const actionLabel = action === "click" ? "Clicking..." : "Typing...";
+    await execInTab(tab.id, pageCursorSystem, ["move", { x: pos.x, y: pos.y, label: actionLabel }], "MAIN");
+    await new Promise(r => setTimeout(r, 400));
+    if (action === "click") {
+      await execInTab(tab.id, pageCursorSystem, ["ripple", { x: pos.x, y: pos.y }], "MAIN");
+    }
+  }
+
+  // Step 3: Perform action via CDP (isTrusted: true)
+  if (action === "click") {
+    await cdpClick(tab.id, pos.x, pos.y);
+  } else {
+    // Fill: focus the element via CDP click, clear, then type
+    await cdpClick(tab.id, pos.x, pos.y);
+    await new Promise(r => setTimeout(r, 50));
+
+    // Select all existing text and replace with new value
+    await safeDebuggerAttach(tab.id);
+    try {
+      await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchKeyEvent", {
+        type: "rawKeyDown", key: "a", code: "KeyA",
+        windowsVirtualKeyCode: 65, modifiers: 2, // Ctrl+A
+      });
+      await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchKeyEvent", {
+        type: "keyUp", key: "a", code: "KeyA",
+        windowsVirtualKeyCode: 65, modifiers: 2,
+      });
+    } finally {
+      await safeDebuggerDetach(tab.id);
+    }
+    await new Promise(r => setTimeout(r, 30));
+
+    // Type the new value character by character
+    await cdpType(tab.id, params.value);
+  }
+
+  // Step 4: Visual effects (cursor mode)
+  if (cursorMode) {
+    if (action !== "click") {
+      await execInTab(tab.id, (sel, refIdx) => {
+        const bridge = window.__claudeBridge;
+        const el = refIdx !== null ? bridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+        if (el) {
+          el.classList.add('__claude_typing_indicator__');
+          setTimeout(() => el.classList.remove('__claude_typing_indicator__'), 800);
+        }
+      }, [params.selector || null, ref], "MAIN");
+    }
+    setTimeout(() => {
+      execInTab(tab.id, pageCursorSystem, ["hide"], "MAIN").catch(() => {});
+    }, 700);
+  }
+
+  const response = {
+    [action === "click" ? "clicked" : "filled"]: params.selector || `ref_${ref}`,
+    waitedMs: Date.now() - started,
+    elementRect: pos.rect,
+    isTrusted: true,
+  };
   return attachScreenshot(response, await autoCapture(tab.id));
 }
 
@@ -485,6 +837,25 @@ async function handle(msg) {
     };
   }
 
+  if (msg.method === "cursor_mode") {
+    cursorMode = Boolean(params.enabled);
+    const speed = params.speed || "normal";
+    // If turning off, clean up any existing cursor overlays
+    if (!cursorMode) {
+      try {
+        const allTabs = await chrome.tabs.query({});
+        for (const t of allTabs) {
+          execInTab(t.id, pageCursorSystem, ["destroy"], "MAIN").catch(() => {});
+        }
+      } catch {}
+    }
+    return { cursor_mode: cursorMode, speed, note: cursorMode
+      ? "Cursor mode ON — a visual pointer will animate to each target before click/fill/hover actions. " +
+        "Users can see exactly what Claude is doing. Actions take ~400ms longer per interaction for the animation."
+      : "Cursor mode OFF — interactions happen instantly without visual cursor."
+    };
+  }
+
   if (msg.method === "select_tab" && params.clear) {
     targetTabId = null;
     chrome.storage.session.remove("targetTabId");
@@ -494,10 +865,26 @@ async function handle(msg) {
 
   if (msg.method === "new_tab") {
     const newTab = await chrome.tabs.create({ url: params.url || "about:blank" });
+    // FIX: Don't auto-mark the new tab — user explicitly opened it for isolated research.
+    // Subsequent tools should still target the original targetTabId, not this new tab.
     return { tab_id: newTab.id, url: newTab.pendingUrl || params.url };
   }
 
   const tab = await resolveTab(params);
+
+  // Early bail for chrome:// and other protected pages
+  const isProtectedPage = tab.url &&
+    (tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://") ||
+     tab.url.startsWith("devtools://") || tab.url.startsWith("view-source:") ||
+     tab.url.startsWith("chrome-untrusted://") ||
+     tab.url.includes("chromewebstore.google.com"));
+  if (isProtectedPage && msg.method !== "select_tab" && msg.method !== "close_tab") {
+    throw new Error(
+      `Cannot access ${tab.url.split("/").slice(0, 3).join("/")} — Chrome blocks all extension ` +
+      `access to this page type. No tools will work here (not eval, snapshot, screenshot, etc.). ` +
+      `Only list_tabs can see this tab exists. Navigate to a regular web page to use bridge tools.`
+    );
+  }
 
   // For select_tab, apply marker synchronously (user needs to see it).
   // For everything else, defer it so it doesn't block the response.
@@ -564,6 +951,15 @@ async function handle(msg) {
             if (typeof result === "object" && result !== null) return JSON.stringify(result, null, 2)?.slice(0, 20000);
             return String(result).slice(0, 20000);
           } catch (e) {
+            const msg = String(e?.message || e);
+            if (msg.includes("Content Security Policy") || msg.includes("Trusted Type")) {
+              return "Error: " + msg +
+                "\n\n[CSP BLOCKED] This site blocks eval via Content Security Policy or Trusted Types. " +
+                "Tools that still work on this page: snapshot, click, fill, hover, get_html, get_styles, " +
+                "get_page_text, get_console, get_network, screenshot, get_element_rect, diagnose, " +
+                "inject_css, check_contrast, annotate, inspect_pixel. " +
+                "Use get_html({selector}) + get_styles({selector}) as eval alternatives for reading DOM/CSS state.";
+            }
             return "Error: " + (e?.stack || String(e));
           }
         },
@@ -635,21 +1031,26 @@ async function handle(msg) {
       const ref = parseRef(params.ref);
       if (ref === null && !params.selector) throw new Error("Provide 'ref' or 'selector'");
       if (ref !== null) await ensureRecorder(tab.id);
-      const result = await execInTab(
-        tab.id,
-        (sel, refIdx) => {
-          let el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : document.querySelector(sel);
-          if (!el) return { error: "Element not found" };
-          el.scrollIntoView({ block: "center" });
-          el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-          el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
-          return { ok: true };
-        },
-        [params.selector || null, ref],
-        "MAIN"
-      );
-      if (result?.error) throw new Error(result.error);
-      return attachScreenshot({ hovered: params.selector || `ref_${ref}` }, await autoCapture(tab.id));
+
+      const pos = await getElementCenter(tab.id, params.selector, ref);
+      if (!pos) throw new Error("Element not found");
+
+      // Cursor mode: animate cursor to hover target
+      if (cursorMode) {
+        await execInTab(tab.id, pageCursorSystem, ["move", { x: pos.x, y: pos.y, label: "Hovering..." }], "MAIN");
+        await new Promise(r => setTimeout(r, 400));
+      }
+
+      // CDP hover: real isTrusted mouseMoved event
+      await cdpHover(tab.id, pos.x, pos.y);
+
+      if (cursorMode) {
+        setTimeout(() => {
+          execInTab(tab.id, pageCursorSystem, ["hide"], "MAIN").catch(() => {});
+        }, 1500);
+      }
+
+      return attachScreenshot({ hovered: params.selector || `ref_${ref}`, elementRect: pos.rect, isTrusted: true }, await autoCapture(tab.id));
     }
 
     case "select_option": {
@@ -660,7 +1061,10 @@ async function handle(msg) {
       const result = await execInTab(
         tab.id,
         (sel, refIdx, values) => {
-          let el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : document.querySelector(sel);
+          // FIX: Safely access bridge and refs
+          const bridge = window.__claudeBridge;
+          if (!bridge) return { error: "Bridge not initialized" };
+          let el = refIdx !== null ? (bridge.refs?.[refIdx] || null) : document.querySelector(sel);
           if (!el || el.tagName !== "SELECT") return { error: "No <select> found" };
           for (const opt of el.options) {
             opt.selected = values.includes(opt.value) || values.includes(opt.textContent.trim());
@@ -701,8 +1105,14 @@ async function handle(msg) {
         tab.id,
         (sel, refIdx, direction, amount) => {
           let el = null;
-          if (refIdx !== null) el = window.__claudeBridge?.refs?.[refIdx];
-          else if (sel) el = document.querySelector(sel);
+          // FIX: Safely access bridge and refs
+          const bridge = window.__claudeBridge;
+          if (refIdx !== null) {
+            if (!bridge || !bridge.refs) return { error: "Bridge not initialized" };
+            el = bridge.refs[refIdx] || null;
+          } else if (sel) {
+            el = document.querySelector(sel);
+          }
           const target = el || document.documentElement;
           const dx = direction === "left" ? -amount : direction === "right" ? amount : 0;
           const dy = direction === "up" ? -amount : direction === "down" ? amount : 0;
@@ -785,7 +1195,7 @@ async function handle(msg) {
           const uniqSel = await execInTab(
             tab.id,
             (refIdx) => {
-              const el = window.__claudeBridge?.refs?.[refIdx];
+              const el = window.__claudeBridge && window.__claudeBridge.refs?.[refIdx];
               if (!el) return null;
               const tmpId = "__claude_upload_" + Date.now();
               el.setAttribute("data-claude-upload", tmpId);
@@ -897,6 +1307,20 @@ async function handle(msg) {
             "[class*='captcha']", "[id*='captcha']", ".g-recaptcha", ".h-captcha",
             "iframe[src*='challenges.cloudflare']", "[id='cf-turnstile']",
           ];
+          // --- CSP detection ---
+          let cspBlocksEval = false;
+          try { new Function("return 1")(); } catch(e) {
+            if (String(e).includes("Content Security Policy") || String(e).includes("Trusted Type"))
+              cspBlocksEval = true;
+          }
+          // --- cross-origin iframes ---
+          const iframes = document.querySelectorAll("iframe");
+          const crossOriginIframes = [];
+          for (const f of iframes) {
+            try { f.contentDocument; } catch(e) {
+              crossOriginIframes.push(f.src?.slice(0, 150) || "(no src)");
+            }
+          }
           return {
             url: location.href,
             title: document.title,
@@ -906,6 +1330,8 @@ async function handle(msg) {
             recentAPICalls: apiCalls,
             hasCaptcha: captchaSelectors.some(s => document.querySelector(s)),
             localStorage_keys: Object.keys(localStorage).slice(0, 30),
+            cspBlocksEval: cspBlocksEval || undefined,
+            crossOriginIframes: crossOriginIframes.length ? crossOriginIframes : undefined,
           };
         },
         [params.max_elements ?? 200],
@@ -924,7 +1350,7 @@ async function handle(msg) {
       const styles = await execInTab(
         tab.id,
         (sel, refIdx, props) => {
-          const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : document.querySelector(sel);
+          const el = refIdx !== null ? window.__claudeBridge && window.__claudeBridge.refs?.[refIdx] : document.querySelector(sel);
           if (!el) return { error: "Element not found" };
           const cs = window.getComputedStyle(el);
           const defaultProps = [
@@ -1175,19 +1601,36 @@ async function handle(msg) {
       const result = await execInTab(
         tab.id,
         (sel, refIdx) => {
-          const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+          const el = refIdx !== null ? window.__claudeBridge && window.__claudeBridge.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
           if (!el) return { error: "Element not found" };
           const cs = window.getComputedStyle(el);
           const fg = cs.color;
-          const bg = cs.backgroundColor;
+          let bg = cs.backgroundColor;
           const fontSize = parseFloat(cs.fontSize);
           const fontWeight = parseInt(cs.fontWeight) || 400;
           const isLarge = fontSize >= 18 || (fontSize >= 14 && fontWeight >= 700);
-          // Parse RGB
           const parse = (c) => {
-            const m = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-            return m ? [+m[1], +m[2], +m[3]] : null;
+            const m = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/);
+            return m ? { rgb: [+m[1], +m[2], +m[3]], a: m[4] !== undefined ? +m[4] : 1 } : null;
           };
+          // Walk up parent chain to find actual visible background
+          let effectiveBg = bg;
+          let bgWalked = false;
+          const parsed = parse(bg);
+          if (parsed && parsed.a < 0.1) {
+            let parent = el.parentElement;
+            while (parent) {
+              const pBg = window.getComputedStyle(parent).backgroundColor;
+              const pParsed = parse(pBg);
+              if (pParsed && pParsed.a >= 0.1) {
+                effectiveBg = pBg;
+                bgWalked = true;
+                break;
+              }
+              parent = parent.parentElement;
+            }
+            if (!bgWalked) { effectiveBg = "rgb(255, 255, 255)"; bgWalked = true; }
+          }
           const luminance = ([r, g, b]) => {
             const [rs, gs, bs] = [r, g, b].map(c => {
               c = c / 255;
@@ -1195,15 +1638,17 @@ async function handle(msg) {
             });
             return 0.2126 * rs + 0.7152 * gs + 0.0722 * bs;
           };
-          const fgRgb = parse(fg);
-          const bgRgb = parse(bg);
-          if (!fgRgb || !bgRgb) return { fg, bg, ratio: "unknown", note: "Could not parse colors" };
+          const fgRgb = parse(fg)?.rgb;
+          const bgRgb = parse(effectiveBg)?.rgb;
+          if (!fgRgb || !bgRgb) return { fg, bg: effectiveBg, ratio: "unknown", note: "Could not parse colors" };
           const l1 = luminance(fgRgb);
           const l2 = luminance(bgRgb);
           const ratio = Math.round(((Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)) * 100) / 100;
           const aaPass = isLarge ? ratio >= 3 : ratio >= 4.5;
           const aaaPass = isLarge ? ratio >= 4.5 : ratio >= 7;
-          return { fg, bg, ratio, isLargeText: isLarge, fontSize, fontWeight, wcag_AA: aaPass ? "PASS" : "FAIL", wcag_AAA: aaaPass ? "PASS" : "FAIL" };
+          const res = { fg, bg: effectiveBg, ratio, isLargeText: isLarge, fontSize, fontWeight, wcag_AA: aaPass ? "PASS" : "FAIL", wcag_AAA: aaaPass ? "PASS" : "FAIL" };
+          if (bgWalked) { res.bg_source = "inherited from parent (element has transparent background)"; res.bg_original = bg; }
+          return res;
         },
         [params.selector || null, parseRef(params.ref)],
         "MAIN"
@@ -1431,7 +1876,7 @@ async function handle(msg) {
       const result = await execInTab(
         tab.id,
         (sel, refIdx, color, duration) => {
-          const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+          const el = refIdx !== null ? window.__claudeBridge && window.__claudeBridge.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
           if (!el) return { error: "Element not found" };
           el.scrollIntoView({ block: "center" });
           const overlay = document.createElement("div");
@@ -1585,7 +2030,7 @@ async function handle(msg) {
       const result = await execInTab(
         tab.id,
         (sel, refIdx) => {
-          const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+          const el = refIdx !== null ? window.__claudeBridge && window.__claudeBridge.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
           if (!el) return { error: "Element not found" };
           const selectors = [];
           if (el.id) selectors.push({ type: "id", selector: "#" + el.id, specificity: "unique" });
@@ -1748,7 +2193,7 @@ async function handle(msg) {
         const rect = await execInTab(
           tab.id,
           (sel, refIdx) => {
-            const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+            const el = refIdx !== null ? window.__claudeBridge && window.__claudeBridge.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
             if (!el) return null;
             const r = el.getBoundingClientRect();
             return { x: r.x, y: r.y, w: r.width, h: r.height };
@@ -1802,7 +2247,7 @@ async function handle(msg) {
       const result = await execInTab(
         tab.id,
         (sel, refIdx, includeChildren) => {
-          const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+          const el = refIdx !== null ? window.__claudeBridge && window.__claudeBridge.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
           if (!el) return { error: "Element not found" };
           const vr = el.getBoundingClientRect();
           const parent = el.offsetParent;
@@ -1906,7 +2351,7 @@ async function handle(msg) {
           const results = [];
           for (const ann of annList) {
             const refIdx = ann.ref !== null && ann.ref !== undefined ? Number(String(ann.ref).replace(/^ref_/, "")) : null;
-            const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (ann.selector ? document.querySelector(ann.selector) : null);
+            const el = refIdx !== null ? window.__claudeBridge && window.__claudeBridge.refs?.[refIdx] : (ann.selector ? document.querySelector(ann.selector) : null);
             if (!el) { results.push({ error: "Not found: " + (ann.selector || "ref_" + refIdx) }); continue; }
             const rect = el.getBoundingClientRect();
             const overlay = document.createElement("div");
@@ -1940,7 +2385,7 @@ async function handle(msg) {
       const result = await execInTab(
         tab.id,
         async (sel, refIdx) => {
-          const el = refIdx !== null ? window.__claudeBridge?.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
+          const el = refIdx !== null ? window.__claudeBridge && window.__claudeBridge.refs?.[refIdx] : (sel ? document.querySelector(sel) : null);
           if (!el) return { error: "Element not found" };
           const rect = el.getBoundingClientRect();
           // Use html2canvas-like approach: draw to an offscreen canvas via drawImage
