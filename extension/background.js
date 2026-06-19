@@ -92,49 +92,91 @@ let markerGrouped = false;
 let observeMode = false; // when true, interaction tools auto-capture screenshot in response
 let cursorMode = false; // when true, visual cursor animates to targets before interactions
 const injectedTabs = new Set();
-const debuggerTabs = new Set();
 
-// F3 FIX: safe debugger attach/detach that tracks state
-async function safeDebuggerAttach(tabId) {
-  if (debuggerTabs.has(tabId)) return;
+// ---------------------------------------------------------------------------
+// CDP Session Manager — persistent, queued, auto-releasing
+// ---------------------------------------------------------------------------
+// Instead of attach/detach per operation, we keep a persistent CDP session
+// per tab and queue all operations through it. This fixes:
+// 1. Batch debugger conflicts (operations serialize instead of failing)
+// 2. ~100ms overhead per attach/detach cycle eliminated
+// 3. Yellow "debugging" bar auto-hides after 30s of inactivity
+
+const cdpSessions = new Map(); // tabId → { attached, queue, idleTimer, useCount }
+const CDP_IDLE_MS = 30000;
+
+async function cdpAttach(tabId) {
   try {
     await chrome.debugger.attach({ tabId }, "1.3");
-    debuggerTabs.add(tabId);
+    return true;
   } catch (e) {
     const msg = String(e?.message || e);
-    if (msg.includes("Already attached")) {
-      debuggerTabs.add(tabId);
-    } else if (msg.includes("Cannot attach") || msg.includes("Cannot access")) {
+    if (msg.includes("Already attached")) return true;
+    if (msg.includes("Cannot attach") || msg.includes("Cannot access")) {
       throw new Error(
-        `Cannot attach debugger to this tab. ` +
-        `Chrome blocks debugger on chrome:// pages, the Chrome Web Store, and other protected pages. ` +
-        `Tools that need the debugger will not work here (screenshot via CDP, performance_trace, ` +
-        `get_accessibility_tree, heap_snapshot_summary, mock_network, emulate_device, upload_file). ` +
-        `Tools that DO work: snapshot, eval, get_html, get_styles, get_console, get_network, click, fill.`
+        `Cannot attach debugger to this tab. Chrome blocks debugger on chrome://, ` +
+        `Chrome Web Store, and other protected pages. Tools that DO work without debugger: ` +
+        `snapshot, get_html, get_styles, get_console, get_network, click, fill.`
       );
-    } else if (msg.includes("Another debugger")) {
-      throw new Error(
-        `Another debugger is already attached to this tab. ` +
-        `This happens when two debugger-dependent tools run at the same time (e.g. in a batch call). ` +
-        `Debugger tools: performance_trace, get_accessibility_tree, heap_snapshot_summary, ` +
-        `mock_network, emulate_device, network_throttle, upload_file, check_contrast. ` +
-        `FIX: Run debugger tools one at a time, not in the same batch call.`
-      );
-    } else {
-      throw e;
     }
+    throw e;
   }
 }
-async function safeDebuggerDetach(tabId) {
-  if (!debuggerTabs.has(tabId)) return;
-  await chrome.debugger.detach({ tabId }).catch(() => {});
-  debuggerTabs.delete(tabId);
+
+function releaseCDP(tabId) {
+  const session = cdpSessions.get(tabId);
+  if (!session || !session.attached) return;
+  chrome.debugger.detach({ tabId }).catch(() => {});
+  session.attached = false;
 }
+
+async function withCDP(tabId, fn) {
+  let session = cdpSessions.get(tabId);
+  if (!session) {
+    session = { attached: false, queue: Promise.resolve(), idleTimer: null, useCount: 0 };
+    cdpSessions.set(tabId, session);
+  }
+  const result = session.queue = session.queue.then(async () => {
+    if (!session.attached) {
+      await cdpAttach(tabId);
+      session.attached = true;
+    }
+    clearTimeout(session.idleTimer);
+    session.useCount++;
+    try {
+      return await fn(tabId);
+    } finally {
+      session.idleTimer = setTimeout(() => releaseCDP(tabId), CDP_IDLE_MS);
+    }
+  }).catch(async (err) => {
+    // If debugger was detached externally (user clicked cancel), clean up
+    const msg = String(err?.message || err);
+    if (msg.includes("Debugger is not attached") || msg.includes("Target closed")) {
+      session.attached = false;
+      cdpSessions.delete(tabId);
+    }
+    throw err;
+  });
+  return result;
+}
+
+// Convenience: send a CDP command through the session
+function cdpSend(tabId, method, params) {
+  return chrome.debugger.sendCommand({ tabId }, method, params || {});
+}
+
 chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId) debuggerTabs.delete(source.tabId);
+  if (source.tabId) {
+    const session = cdpSessions.get(source.tabId);
+    if (session) { session.attached = false; clearTimeout(session.idleTimer); }
+    cdpSessions.delete(source.tabId);
+  }
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
-  debuggerTabs.delete(tabId);
+  const session = cdpSessions.get(tabId);
+  if (session) clearTimeout(session.idleTimer);
+  cdpSessions.delete(tabId);
+  injectedTabs.delete(tabId);
 });
 
 chrome.storage.session
@@ -364,7 +406,6 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   injectedTabs.delete(tabId);
-  debuggerTabs.delete(tabId);
   if (tabId === markedTabId) { markedTabId = null; markerGrouped = false; }
   if (tabId === targetTabId) { targetTabId = null; chrome.storage.session.remove("targetTabId"); }
 });
@@ -373,10 +414,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 async function autoCapture(tabId) {
   if (!observeMode) return null;
   try {
-    const tab = await chrome.tabs.get(tabId);
-    if (!tab.active) { await chrome.tabs.update(tabId, { active: true }); await new Promise(r => setTimeout(r, 150)); }
     if (markedTabId === tabId) await applyMarker(tabId, false);
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png", quality: 70 });
+    const dataUrl = await withCDP(tabId, async () => {
+      const { data } = await cdpSend(tabId, "Page.captureScreenshot", { format: "png", quality: 70 });
+      return "data:image/png;base64," + data;
+    });
     if (markedTabId === tabId) applyMarker(tabId, true);
     return dataUrl;
   } catch { return null; }
@@ -401,7 +443,9 @@ async function ensureRecorder(tabId) {
   if (injectedTabs.has(tabId)) return false;
   const present = await execInTab(tabId, () => Boolean(window.__claudeBridge), [], "MAIN");
   if (present) { injectedTabs.add(tabId); return false; }
-  await chrome.scripting.executeScript({ target: { tabId }, files: ["inject.js"], world: "MAIN" });
+  await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ["inject.js"], world: "MAIN" }).catch(() =>
+    chrome.scripting.executeScript({ target: { tabId }, files: ["inject.js"], world: "MAIN" })
+  );
   injectedTabs.add(tabId);
   return true;
 }
@@ -563,10 +607,11 @@ function pageSnapshot(maxElements) {
       || el.getAttribute("alt") || el.getAttribute("title") || el.getAttribute("name") || "";
   };
   const lines = [];
-  const els = document.querySelectorAll(SELECTOR);
-  for (let i = 0; i < els.length && lines.length < maxElements; i++) {
-    const el = els[i];
-    if (!el.offsetParent && el.tagName !== "BODY") continue; // faster than getClientRects
+  const added = new Set();
+  const addEl = (el) => {
+    if (added.has(el) || lines.length >= maxElements) return;
+    if (!el.offsetParent && el.tagName !== "BODY" && !el.closest('[role="dialog"],[role="listbox"],[role="menu"],dialog[open]')) return;
+    added.add(el);
     const idx = bridge.refs.length;
     bridge.refs.push(el);
     const tag = el.tagName.toLowerCase();
@@ -586,7 +631,40 @@ function pageSnapshot(maxElements) {
     lines.push(
       `ref_${idx} <${kind}> "${accessibleName(el)}"${state.length ? " (" + state.join(", ") + ")" : ""}`
     );
+  };
+
+  // Phase 1: Standard interactive element scan
+  for (const el of document.querySelectorAll(SELECTOR)) addEl(el);
+
+  // Phase 2: Portal/overlay containers (React portals, Radix, MUI, Headless UI, GitHub Primer)
+  const portalSelectors = [
+    '[role="dialog"]', '[role="listbox"]', '[role="menu"]', '[role="menubar"]',
+    '[role="tooltip"]', '[role="alertdialog"]', '[data-portal]',
+    '[data-radix-popper-content-wrapper]', '[data-floating-ui-portal]',
+    '[data-headlessui-portal]', '.MuiPopover-root', '.MuiModal-root', '.MuiMenu-root',
+    '[class*="Overlay--"]', '[class*="ActionList"]', 'dialog[open]',
+    '[popover]:not([popover=""])', '[data-tippy-root]',
+  ];
+  for (const ps of portalSelectors) {
+    try {
+      for (const container of document.querySelectorAll(ps)) {
+        for (const el of container.querySelectorAll(SELECTOR)) addEl(el);
+      }
+    } catch {}
   }
+
+  // Phase 3: Walk open shadow roots
+  const walkShadow = (root, depth) => {
+    if (depth > 3 || lines.length >= maxElements) return;
+    for (const el of root.querySelectorAll("*")) {
+      if (el.shadowRoot) {
+        for (const child of el.shadowRoot.querySelectorAll(SELECTOR)) addEl(child);
+        walkShadow(el.shadowRoot, depth + 1);
+      }
+    }
+  };
+  try { walkShadow(document, 0); } catch {}
+
   if (lines.length >= maxElements) lines.push(`… truncated at ${maxElements} elements`);
   // Cross-origin iframe detection.
   let crossOriginCount = 0;
@@ -612,22 +690,27 @@ function pageWaitFor(sel, text, timeoutMs) {
   return new Promise((resolve) => {
     const started = Date.now();
     const check = () => {
-      let found = false;
       if (sel) {
         const el = document.querySelector(sel);
-        found = Boolean(el) && (!text || (el.innerText || "").includes(text));
-      } else if (text) {
-        found = Boolean(document.body?.innerText?.includes(text));
+        return Boolean(el) && (!text || (el.innerText || "").includes(text));
       }
-      if (found) return resolve({ ok: true, waitedMs: Date.now() - started });
-      if (Date.now() - started >= timeoutMs) {
-        return resolve({
-          error: `Timed out after ${timeoutMs}ms waiting for ${sel ? `selector "${sel}"` : ""}${sel && text ? " containing " : ""}${text ? `text "${text}"` : ""}`,
-        });
-      }
-      setTimeout(check, 150); // was 200
+      return text ? Boolean(document.body?.innerText?.includes(text)) : false;
     };
-    check();
+    if (check()) return resolve({ ok: true, waitedMs: 0 });
+    // Use MutationObserver for instant detection instead of polling
+    const observer = new MutationObserver(() => {
+      if (check()) { observer.disconnect(); resolve({ ok: true, waitedMs: Date.now() - started }); }
+    });
+    observer.observe(document.body || document.documentElement, {
+      childList: true, subtree: true, characterData: true, attributes: true,
+    });
+    setTimeout(() => {
+      observer.disconnect();
+      if (check()) resolve({ ok: true, waitedMs: Date.now() - started });
+      else resolve({
+        error: `Timed out after ${timeoutMs}ms waiting for ${sel ? `selector "${sel}"` : ""}${sel && text ? " containing " : ""}${text ? `text "${text}"` : ""}`,
+      });
+    }, timeoutMs);
   });
 }
 
@@ -645,60 +728,49 @@ function parseRef(ref) {
 // ---------------------------------------------------------------------------
 
 async function cdpClick(tabId, x, y) {
-  await safeDebuggerAttach(tabId);
-  try {
-    // Move → Press → Release — the same sequence Playwright uses
-    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+  return withCDP(tabId, async () => {
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
       type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
     });
-    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
       type: "mousePressed", x, y, button: "left", buttons: 1,
       clickCount: 1, pointerType: "mouse",
     });
-    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
       type: "mouseReleased", x, y, button: "left", buttons: 0,
       clickCount: 1, pointerType: "mouse",
     });
-  } finally {
-    await safeDebuggerDetach(tabId);
-  }
+  });
 }
 
 async function cdpType(tabId, text) {
-  await safeDebuggerAttach(tabId);
-  try {
+  return withCDP(tabId, async () => {
     for (const char of text) {
       const code = char.charCodeAt(0);
       if (code > 127) {
-        // Non-ASCII: use insertText (IME-style, handles emoji/unicode)
-        await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text: char });
+        await cdpSend(tabId, "Input.insertText", { text: char });
       } else {
-        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+        await cdpSend(tabId, "Input.dispatchKeyEvent", {
           type: "keyDown", text: char, key: char,
           code: char === " " ? "Space" : "Key" + char.toUpperCase(),
           windowsVirtualKeyCode: code, nativeVirtualKeyCode: code,
         });
-        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+        await cdpSend(tabId, "Input.dispatchKeyEvent", {
           type: "keyUp", key: char,
           code: char === " " ? "Space" : "Key" + char.toUpperCase(),
           windowsVirtualKeyCode: code, nativeVirtualKeyCode: code,
         });
       }
     }
-  } finally {
-    await safeDebuggerDetach(tabId);
-  }
+  });
 }
 
 async function cdpHover(tabId, x, y) {
-  await safeDebuggerAttach(tabId);
-  try {
-    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+  return withCDP(tabId, async () => {
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
       type: "mouseMoved", x, y, button: "none", buttons: 0, pointerType: "mouse",
     });
-  } finally {
-    await safeDebuggerDetach(tabId);
-  }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -760,25 +832,33 @@ async function actOnElement(tab, params, action) {
   // Step 3: Perform action via CDP (isTrusted: true)
   if (action === "click") {
     await cdpClick(tab.id, pos.x, pos.y);
+    // Wait for DOM to stabilize after click (dropdowns, modals, SPA navigation)
+    await execInTab(tab.id, () => {
+      return new Promise(resolve => {
+        let timer = null;
+        const done = () => { obs.disconnect(); resolve(true); };
+        const obs = new MutationObserver(() => { clearTimeout(timer); timer = setTimeout(done, 80); });
+        obs.observe(document.body || document.documentElement, { childList: true, subtree: true, attributes: true });
+        timer = setTimeout(done, 80);
+        setTimeout(done, 500); // hard cap
+      });
+    }, [], "MAIN").catch(() => {});
   } else {
     // Fill: focus the element via CDP click, clear, then type
     await cdpClick(tab.id, pos.x, pos.y);
     await new Promise(r => setTimeout(r, 50));
 
     // Select all existing text and replace with new value
-    await safeDebuggerAttach(tab.id);
-    try {
-      await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchKeyEvent", {
+    await withCDP(tab.id, async () => {
+      await cdpSend(tab.id, "Input.dispatchKeyEvent", {
         type: "rawKeyDown", key: "a", code: "KeyA",
         windowsVirtualKeyCode: 65, modifiers: 2, // Ctrl+A
       });
-      await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchKeyEvent", {
+      await cdpSend(tab.id, "Input.dispatchKeyEvent", {
         type: "keyUp", key: "a", code: "KeyA",
         windowsVirtualKeyCode: 65, modifiers: 2,
       });
-    } finally {
-      await safeDebuggerDetach(tab.id);
-    }
+    });
     await new Promise(r => setTimeout(r, 30));
 
     // Type the new value character by character
@@ -943,30 +1023,42 @@ async function handle(msg) {
     }
 
     case "eval": {
-      const value = await execInTab(
-        tab.id,
-        (code) => {
-          try {
-            const result = window.eval(code);
-            if (typeof result === "object" && result !== null) return JSON.stringify(result, null, 2)?.slice(0, 20000);
-            return String(result).slice(0, 20000);
-          } catch (e) {
-            const msg = String(e?.message || e);
-            if (msg.includes("Content Security Policy") || msg.includes("Trusted Type")) {
-              return "Error: " + msg +
-                "\n\n[CSP BLOCKED] This site blocks eval via Content Security Policy or Trusted Types. " +
-                "Tools that still work on this page: snapshot, click, fill, hover, get_html, get_styles, " +
-                "get_page_text, get_console, get_network, screenshot, get_element_rect, diagnose, " +
-                "inject_css, check_contrast, annotate, inspect_pixel. " +
-                "Use get_html({selector}) + get_styles({selector}) as eval alternatives for reading DOM/CSS state.";
-            }
-            return "Error: " + (e?.stack || String(e));
+      // Try CDP Runtime.evaluate first — bypasses CSP on all sites
+      try {
+        const value = await withCDP(tab.id, async () => {
+          const { result: r, exceptionDetails } = await cdpSend(
+            tab.id, "Runtime.evaluate",
+            { expression: params.code, returnByValue: true, awaitPromise: true, generatePreview: true }
+          );
+          if (exceptionDetails) {
+            const errMsg = exceptionDetails.exception?.description || exceptionDetails.text || "Evaluation failed";
+            return "Error: " + errMsg;
           }
-        },
-        [params.code],
-        "MAIN"
-      );
-      return { value };
+          if (r.type === "undefined") return "undefined";
+          if (r.value !== undefined) {
+            return typeof r.value === "object" ? JSON.stringify(r.value, null, 2)?.slice(0, 20000) : String(r.value).slice(0, 20000);
+          }
+          return String(r.description || r.unserializableValue || r.type).slice(0, 20000);
+        });
+        return { value };
+      } catch (cdpErr) {
+        // CDP unavailable (protected page) — fall back to script injection
+        const value = await execInTab(
+          tab.id,
+          (code) => {
+            try {
+              const result = window.eval(code);
+              if (typeof result === "object" && result !== null) return JSON.stringify(result, null, 2)?.slice(0, 20000);
+              return String(result).slice(0, 20000);
+            } catch (e) {
+              return "Error: " + (e?.stack || String(e));
+            }
+          },
+          [params.code],
+          "MAIN"
+        );
+        return { value };
+      }
     }
 
     case "get_console": {
@@ -1004,16 +1096,28 @@ async function handle(msg) {
     }
 
     case "screenshot": {
-      if (!tab.active) {
-        await chrome.tabs.update(tab.id, { active: true });
-        await new Promise((r) => setTimeout(r, 200)); // was 300
-      }
-      if (markedTabId === tab.id) await applyMarker(tab.id, false);
+      // Use CDP Page.captureScreenshot — works on background tabs without stealing focus
       try {
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+        if (markedTabId === tab.id) await applyMarker(tab.id, false);
+        const dataUrl = await withCDP(tab.id, async () => {
+          const { data } = await cdpSend(tab.id, "Page.captureScreenshot", { format: "png" });
+          return "data:image/png;base64," + data;
+        });
+        if (markedTabId === tab.id) applyMarker(tab.id, true);
         return { tab_id: tab.id, url: tab.url, dataUrl };
-      } finally {
-        if (markedTabId === tab.id) applyMarker(tab.id, true); // fire-and-forget restore
+      } catch {
+        // Fallback to captureVisibleTab if CDP fails (e.g. protected pages)
+        if (!tab.active) {
+          await chrome.tabs.update(tab.id, { active: true });
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        if (markedTabId === tab.id) await applyMarker(tab.id, false);
+        try {
+          const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+          return { tab_id: tab.id, url: tab.url, dataUrl };
+        } finally {
+          if (markedTabId === tab.id) applyMarker(tab.id, true);
+        }
       }
     }
 
@@ -1081,9 +1185,31 @@ async function handle(msg) {
 
     case "press_key": {
       if (!params.key) throw new Error("'key' is required");
-      return await execInTab(
-        tab.id,
-        (key, modifiers) => {
+      const KEY_CODES = {
+        Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, Space: 32,
+        ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+        Home: 36, End: 35, PageUp: 33, PageDown: 34,
+        F1: 112, F2: 113, F3: 114, F4: 115, F5: 116, F6: 117,
+        F7: 118, F8: 119, F9: 120, F10: 121, F11: 122, F12: 123,
+      };
+      try {
+        await withCDP(tab.id, async () => {
+          const key = params.key;
+          const vk = KEY_CODES[key] || key.toUpperCase().charCodeAt(0);
+          const mods = (params.modifiers || []);
+          const modBits = mods.reduce((m, mod) =>
+            m | (mod === "Control" ? 2 : mod === "Shift" ? 8 : mod === "Alt" ? 1 : mod === "Meta" ? 4 : 0), 0);
+          await cdpSend(tab.id, "Input.dispatchKeyEvent", {
+            type: "rawKeyDown", key, code: key, windowsVirtualKeyCode: vk, modifiers: modBits,
+          });
+          await cdpSend(tab.id, "Input.dispatchKeyEvent", {
+            type: "keyUp", key, code: key, windowsVirtualKeyCode: vk, modifiers: modBits,
+          });
+        });
+        return { ok: true, key: params.key, isTrusted: true };
+      } catch {
+        // Fallback to DOM events if CDP unavailable
+        return await execInTab(tab.id, (key, modifiers) => {
           const target = document.activeElement || document.body;
           const opts = {
             key, code: key, bubbles: true, cancelable: true,
@@ -1091,13 +1217,10 @@ async function handle(msg) {
             altKey: modifiers.includes("Alt"), metaKey: modifiers.includes("Meta"),
           };
           target.dispatchEvent(new KeyboardEvent("keydown", opts));
-          target.dispatchEvent(new KeyboardEvent("keypress", opts));
           target.dispatchEvent(new KeyboardEvent("keyup", opts));
-          return { ok: true, key, target: target.tagName };
-        },
-        [params.key, params.modifiers || []],
-        "MAIN"
-      );
+          return { ok: true, key, target: target.tagName, isTrusted: false };
+        }, [params.key, params.modifiers || []], "MAIN");
+      }
     }
 
     case "scroll": {
@@ -1145,6 +1268,11 @@ async function handle(msg) {
       return { closed: tab.id };
     }
 
+    case "detach_debugger": {
+      releaseCDP(tab.id);
+      return { detached: tab.id, note: "Debugger detached — yellow bar removed." };
+    }
+
     case "get_cookies": {
       const cookies = await chrome.cookies.getAll({ url: tab.url });
       return {
@@ -1186,10 +1314,9 @@ async function handle(msg) {
       const ref = parseRef(params.ref);
       if (ref === null && !params.selector) throw new Error("Provide 'ref' or 'selector' for the file input");
       if (!params.file_path) throw new Error("'file_path' is required");
-      await safeDebuggerAttach(tab.id);
-      try {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.enable");
-        const { root } = await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.getDocument");
+      return await withCDP(tab.id, async () => {
+        await cdpSend(tab.id, "DOM.enable");
+        const { root } = await cdpSend(tab.id, "DOM.getDocument");
         let nodeId;
         if (ref !== null) {
           const uniqSel = await execInTab(
@@ -1205,22 +1332,20 @@ async function handle(msg) {
             "MAIN"
           );
           if (!uniqSel) throw new Error(`ref_${ref} not found`);
-          ({ nodeId } = await chrome.debugger.sendCommand(
-            { tabId: tab.id }, "DOM.querySelector", { nodeId: root.nodeId, selector: uniqSel }
+          ({ nodeId } = await cdpSend(
+            tab.id, "DOM.querySelector", { nodeId: root.nodeId, selector: uniqSel }
           ));
         } else {
-          ({ nodeId } = await chrome.debugger.sendCommand(
-            { tabId: tab.id }, "DOM.querySelector", { nodeId: root.nodeId, selector: params.selector }
+          ({ nodeId } = await cdpSend(
+            tab.id, "DOM.querySelector", { nodeId: root.nodeId, selector: params.selector }
           ));
         }
         if (!nodeId) throw new Error("File input element not found in DOM");
-        await chrome.debugger.sendCommand(
-          { tabId: tab.id }, "DOM.setFileInputFiles", { files: [params.file_path], nodeId }
+        await cdpSend(
+          tab.id, "DOM.setFileInputFiles", { files: [params.file_path], nodeId }
         );
         return { uploaded: params.file_path, to: params.selector || `ref_${ref}` };
-      } finally {
-        await safeDebuggerDetach(tab.id);
-      }
+      });
     }
 
     case "get_page_info": {
@@ -1378,11 +1503,10 @@ async function handle(msg) {
     }
 
     case "get_accessibility_tree": {
-      await safeDebuggerAttach(tab.id);
-      try {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Accessibility.enable");
-        const { nodes } = await chrome.debugger.sendCommand(
-          { tabId: tab.id }, "Accessibility.getFullAXTree", { max_depth: params.max_depth ?? 5 }
+      return await withCDP(tab.id, async () => {
+        await cdpSend(tab.id, "Accessibility.enable");
+        const { nodes } = await cdpSend(
+          tab.id, "Accessibility.getFullAXTree", { max_depth: params.max_depth ?? 5 }
         );
         const filtered = nodes
           .filter(n => n.role?.value && n.role.value !== "none" && n.role.value !== "GenericContainer")
@@ -1396,17 +1520,14 @@ async function handle(msg) {
           }))
           .filter(n => n.name || n.role !== "StaticText");
         return { tab_id: tab.id, url: tab.url, nodes: filtered };
-      } finally {
-        await safeDebuggerDetach(tab.id);
-      }
+      });
     }
 
     case "performance_trace": {
-      await safeDebuggerAttach(tab.id);
-      try {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Performance.enable");
+      return await withCDP(tab.id, async () => {
+        await cdpSend(tab.id, "Performance.enable");
         // Collect metrics
-        const { metrics } = await chrome.debugger.sendCommand({ tabId: tab.id }, "Performance.getMetrics");
+        const { metrics } = await cdpSend(tab.id, "Performance.getMetrics");
         const metricsObj = {};
         for (const m of metrics) metricsObj[m.name] = Math.round(m.value * 1000) / 1000;
         // Also get navigation timing from the page
@@ -1434,26 +1555,21 @@ async function handle(msg) {
           [],
           "MAIN"
         );
+        await cdpSend(tab.id, "Performance.disable").catch(() => {});
         return { tab_id: tab.id, url: tab.url, webVitals: timing, cdpMetrics: metricsObj };
-      } finally {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Performance.disable").catch(() => {});
-        await safeDebuggerDetach(tab.id);
-      }
+      });
     }
 
     case "heap_snapshot_summary": {
-      await safeDebuggerAttach(tab.id);
-      try {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "HeapProfiler.enable");
+      return await withCDP(tab.id, async () => {
+        await cdpSend(tab.id, "HeapProfiler.enable");
         // Collect heap stats without a full snapshot (faster)
-        const { result } = await chrome.debugger.sendCommand(
-          { tabId: tab.id }, "Runtime.evaluate",
+        const { result } = await cdpSend(tab.id, "Runtime.evaluate",
           { expression: "JSON.stringify({usedJSHeapSize: performance.memory?.usedJSHeapSize, totalJSHeapSize: performance.memory?.totalJSHeapSize, jsHeapSizeLimit: performance.memory?.jsHeapSizeLimit})", returnByValue: true }
         );
         const memory = JSON.parse(result.value || "{}");
         // Get object counts by type
-        const { result: objCount } = await chrome.debugger.sendCommand(
-          { tabId: tab.id }, "Runtime.evaluate",
+        const { result: objCount } = await cdpSend(tab.id, "Runtime.evaluate",
           { expression: "JSON.stringify({domNodes: document.getElementsByTagName('*').length, eventListeners: 'see DevTools for count', detachedNodes: 'requires full heap snapshot'})", returnByValue: true }
         );
         const domInfo = JSON.parse(objCount.value || "{}");
@@ -1467,15 +1583,12 @@ async function handle(msg) {
           },
           dom: domInfo,
         };
-      } finally {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "HeapProfiler.disable").catch(() => {});
-        await safeDebuggerDetach(tab.id);
-      }
+        await cdpSend(tab.id, "HeapProfiler.disable").catch(() => {});
+      });
     }
 
     case "emulate_device": {
-      await safeDebuggerAttach(tab.id);
-      try {
+      return await withCDP(tab.id, async () => {
         const presets = {
           "mobile": { width: 375, height: 812, scale: 3, mobile: true, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
           "tablet": { width: 768, height: 1024, scale: 2, mobile: true, ua: "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" },
@@ -1484,35 +1597,29 @@ async function handle(msg) {
         const device = params.device?.toLowerCase();
         const preset = presets[device];
         if (params.clear || device === "reset") {
-          await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.clearDeviceMetricsOverride");
-          await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setUserAgentOverride", { userAgent: "" });
-          await safeDebuggerDetach(tab.id);
+          await cdpSend(tab.id, "Emulation.clearDeviceMetricsOverride");
+          await cdpSend(tab.id, "Emulation.setUserAgentOverride", { userAgent: "" });
           return { tab_id: tab.id, emulation: "cleared" };
         }
         const w = params.width || preset?.width || 1440;
         const h = params.height || preset?.height || 900;
         const scale = params.device_scale || preset?.scale || 1;
         const mobile = params.mobile ?? preset?.mobile ?? false;
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setDeviceMetricsOverride", {
+        await cdpSend(tab.id, "Emulation.setDeviceMetricsOverride", {
           width: w, height: h, deviceScaleFactor: scale, mobile,
         });
         if (preset?.ua || params.user_agent) {
-          await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setUserAgentOverride", {
+          await cdpSend(tab.id, "Emulation.setUserAgentOverride", {
             userAgent: params.user_agent || preset.ua,
           });
         }
-        // Don't detach — keep emulation active until cleared
         return { tab_id: tab.id, emulation: { width: w, height: h, scale, mobile, device: device || "custom" } };
-      } catch (e) {
-        await safeDebuggerDetach(tab.id);
-        throw e;
-      }
+      });
     }
 
     case "network_throttle": {
-      await safeDebuggerAttach(tab.id);
-      try {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.enable");
+      return await withCDP(tab.id, async () => {
+        await cdpSend(tab.id, "Network.enable");
         const presets = {
           "offline": { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
           "slow-3g": { offline: false, latency: 2000, downloadThroughput: 50000, uploadThroughput: 50000 },
@@ -1521,45 +1628,31 @@ async function handle(msg) {
           "none": { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 },
         };
         const preset = presets[params.preset?.toLowerCase()] || presets.none;
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.emulateNetworkConditions", preset);
-        if (params.preset === "none") {
-          await safeDebuggerDetach(tab.id);
-        }
+        await cdpSend(tab.id, "Network.emulateNetworkConditions", preset);
         return { tab_id: tab.id, throttle: params.preset || "none" };
-      } catch (e) {
-        await safeDebuggerDetach(tab.id);
-        throw e;
-      }
+      });
     }
 
     case "full_page_screenshot": {
-      await safeDebuggerAttach(tab.id);
-      try {
+      return await withCDP(tab.id, async () => {
         if (markedTabId === tab.id) await applyMarker(tab.id, false);
-        const { data } = await chrome.debugger.sendCommand(
-          { tabId: tab.id }, "Page.captureScreenshot", { format: "png", captureBeyondViewport: true, fromSurface: true }
+        const { data } = await cdpSend(tab.id, "Page.captureScreenshot", { format: "png", captureBeyondViewport: true, fromSurface: true }
         );
         if (markedTabId === tab.id) applyMarker(tab.id, true);
         return { tab_id: tab.id, url: tab.url, dataUrl: "data:image/png;base64," + data };
-      } finally {
-        await safeDebuggerDetach(tab.id);
-      }
+      });
     }
 
     case "export_pdf": {
-      await safeDebuggerAttach(tab.id);
-      try {
-        const { data } = await chrome.debugger.sendCommand(
-          { tabId: tab.id }, "Page.printToPDF", {
+      return await withCDP(tab.id, async () => {
+        const { data } = await cdpSend(tab.id, "Page.printToPDF", {
             printBackground: true,
             preferCSSPageSize: true,
             format: params.format || "A4",
           }
         );
         return { tab_id: tab.id, url: tab.url, pdfBase64: data.slice(0, 50000), totalLength: data.length };
-      } finally {
-        await safeDebuggerDetach(tab.id);
-      }
+      });
     }
 
     case "watch_dom_changes": {
@@ -1658,23 +1751,19 @@ async function handle(msg) {
     }
 
     case "handle_dialog": {
-      await safeDebuggerAttach(tab.id);
-      try {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.enable");
+      return await withCDP(tab.id, async () => {
+        await cdpSend(tab.id, "Page.enable");
         // Set up handler for the next dialog
         const accept = params.accept !== false;
         const promptText = params.prompt_text || "";
         chrome.debugger.onEvent.addListener(function handler(source, method, eventParams) {
           if (method === "Page.javascriptDialogOpening") {
-            chrome.debugger.sendCommand({ tabId: tab.id }, "Page.handleJavaScriptDialog", { accept, promptText });
+            cdpSend(tab.id, "Page.handleJavaScriptDialog", { accept, promptText });
             chrome.debugger.onEvent.removeListener(handler);
           }
         });
         return { tab_id: tab.id, action: accept ? "will accept" : "will dismiss", note: "Waiting for the next dialog" };
-      } catch (e) {
-        await safeDebuggerDetach(tab.id);
-        throw e;
-      }
+      });
     }
 
     case "get_clipboard": {
@@ -1845,19 +1934,18 @@ async function handle(msg) {
     }
 
     case "mock_network": {
-      await safeDebuggerAttach(tab.id);
-      try {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Fetch.enable", {
+      return await withCDP(tab.id, async () => {
+        await cdpSend(tab.id, "Fetch.enable", {
           patterns: [{ urlPattern: params.url_pattern || "*", requestStage: "Response" }],
         });
         const mockBody = params.response_body ? btoa(typeof params.response_body === "string" ? params.response_body : JSON.stringify(params.response_body)) : null;
         chrome.debugger.onEvent.addListener(function handler(source, method, eventParams) {
           if (source.tabId !== tab.id || method !== "Fetch.requestPaused") return;
           if (params.url_pattern && !eventParams.request.url.includes(params.url_pattern.replace("*", ""))) {
-            chrome.debugger.sendCommand({ tabId: tab.id }, "Fetch.continueRequest", { requestId: eventParams.requestId });
+            cdpSend(tab.id, "Fetch.continueRequest", { requestId: eventParams.requestId });
             return;
           }
-          chrome.debugger.sendCommand({ tabId: tab.id }, "Fetch.fulfillRequest", {
+          cdpSend(tab.id, "Fetch.fulfillRequest", {
             requestId: eventParams.requestId,
             responseCode: params.status_code || 200,
             responseHeaders: [{ name: "Content-Type", value: params.content_type || "application/json" }],
@@ -1865,10 +1953,7 @@ async function handle(msg) {
           });
         });
         return { tab_id: tab.id, mocking: params.url_pattern, status: params.status_code || 200, note: "Network mock active. Reload or navigate to trigger. Detach debugger to stop." };
-      } catch (e) {
-        await safeDebuggerDetach(tab.id);
-        throw e;
-      }
+      });
     }
 
     case "highlight_element": {
@@ -2093,35 +2178,26 @@ async function handle(msg) {
     // =====================================================================
 
     case "set_geolocation": {
-      await safeDebuggerAttach(tab.id);
-      try {
+      return await withCDP(tab.id, async () => {
         if (params.clear) {
-          await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.clearGeolocationOverride");
-          await safeDebuggerDetach(tab.id);
-          return { tab_id: tab.id, geolocation: "cleared" };
+          await cdpSend(tab.id, "Emulation.clearGeolocationOverride");
+            return { tab_id: tab.id, geolocation: "cleared" };
         }
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setGeolocationOverride", {
+        await cdpSend(tab.id, "Emulation.setGeolocationOverride", {
           latitude: params.latitude || 28.6139, longitude: params.longitude || 77.2090, accuracy: params.accuracy || 100,
         });
         return { tab_id: tab.id, geolocation: { lat: params.latitude || 28.6139, lng: params.longitude || 77.2090 } };
-      } catch (e) {
-        await safeDebuggerDetach(tab.id);
-        throw e;
-      }
+      });
     }
 
     case "toggle_dark_mode": {
-      await safeDebuggerAttach(tab.id);
-      try {
+      return await withCDP(tab.id, async () => {
         const isDark = params.dark !== false;
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setEmulatedMedia", {
+        await cdpSend(tab.id, "Emulation.setEmulatedMedia", {
           features: [{ name: "prefers-color-scheme", value: isDark ? "dark" : "light" }],
         });
         return { tab_id: tab.id, darkMode: isDark };
-      } catch (e) {
-        await safeDebuggerDetach(tab.id);
-        throw e;
-      }
+      });
     }
 
     case "edit_cookie": {
@@ -2181,8 +2257,7 @@ async function handle(msg) {
 
     case "inspect_pixel": {
       // #1: Sample RGBA at a coordinate on any rendered element (bypasses CORS on images)
-      await safeDebuggerAttach(tab.id);
-      try {
+      return await withCDP(tab.id, async () => {
         // Use CDP to screenshot just the element region, then read the pixel from the image
         const x = params.x ?? 0;
         const y = params.y ?? 0;
@@ -2208,8 +2283,7 @@ async function handle(msg) {
         const pixelY = params.percent ? Math.round(rect.y + rect.h * (y / 100)) : Math.round(rect.y + y);
 
         // Capture a 1x1 screenshot at that exact pixel using CDP
-        const { data } = await chrome.debugger.sendCommand(
-          { tabId: tab.id }, "Page.captureScreenshot",
+        const { data } = await cdpSend(tab.id, "Page.captureScreenshot",
           { format: "png", clip: { x: pixelX, y: pixelY, width: 1, height: 1, scale: 1 } }
         );
 
@@ -2236,9 +2310,7 @@ async function handle(msg) {
           "MAIN"
         );
         return { tab_id: tab.id, ...rgba };
-      } finally {
-        await safeDebuggerDetach(tab.id);
-      }
+      });
     }
 
     case "get_element_rect": {

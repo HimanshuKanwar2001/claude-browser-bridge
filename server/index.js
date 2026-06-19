@@ -428,7 +428,7 @@ ANTI-PATTERNS:
 const BATCH_TOOL = {
   name: "batch",
   description:
-    "Execute multiple tool calls in a single round-trip for speed. Pass an array of {name, arguments} objects. All calls run in parallel and results are returned in the same order. ALWAYS prefer this over sequential calls. IMPORTANT: Never batch two debugger-dependent tools together (performance_trace, get_accessibility_tree, heap_snapshot_summary, mock_network, emulate_device, network_throttle, upload_file) — only one debugger can attach per tab. Safe to batch: screenshot, get_styles, get_html, get_console, get_network, eval, snapshot.",
+    "Execute multiple tool calls in a single round-trip for speed. Pass an array of {name, arguments} objects. All calls run in parallel. ALWAYS prefer this over sequential calls. CDP operations are automatically queued (no more debugger conflicts) — you can now safely batch ANY combination of tools including performance_trace + get_accessibility_tree.",
   inputSchema: {
     type: "object",
     properties: {
@@ -506,7 +506,7 @@ const TOOLS = [
   {
     name: "snapshot",
     description:
-      "Snapshot the visible interactive elements of the page (buttons, links, inputs, etc.) as ref-tagged lines like: ref_12 <button> \"Sign in\". Pass the ref to click/fill — far more reliable than guessing CSS selectors. Refs are invalidated by navigation or a new snapshot.",
+      "Snapshot all interactive elements including React portals, shadow DOM, overlays, and dropdown menus as ref-tagged lines like: ref_12 <button> \"Sign in\". Scans portal containers (Radix, MUI, Headless UI, GitHub Primer), walks open shadow roots, and detects dialog/listbox/menu overlays. Pass refs to click/fill. Refs invalidated by navigation or new snapshot.",
     inputSchema: {
       type: "object",
       properties: {
@@ -532,7 +532,7 @@ const TOOLS = [
   {
     name: "wait_for",
     description:
-      "Wait until a CSS selector and/or a text string appears on the page (polls every 200ms). Use after click/navigate on SPAs to know when the page settled. Example: {selector: \".results\", text: \"42 items\"}.",
+      "Wait until a CSS selector and/or text appears on the page. Uses MutationObserver for instant detection (no polling delay). Resolves in < 1ms if condition already met. Use after click/navigate on SPAs.",
     inputSchema: {
       type: "object",
       properties: {
@@ -578,7 +578,7 @@ const TOOLS = [
   },
   {
     name: "eval",
-    description: "Evaluate JavaScript in the page's main world and return the result as a string. NOTE: Blocked on CSP-strict sites (GitHub, YouTube, MDN, CodePen) — if eval fails with CSP/Trusted Types error, use get_html + get_styles + get_page_text instead. All other tools (snapshot, click, fill, screenshot, get_console, get_network) work on every site regardless of CSP.",
+    description: "Evaluate JavaScript in the page context and return the result as a string. Uses CDP Runtime.evaluate (bypasses CSP — works on GitHub, YouTube, MDN, and all sites). Falls back to script injection if CDP unavailable. Does NOT steal tab focus — runs on background tabs.",
     inputSchema: {
       type: "object",
       properties: { code: { type: "string" }, ...TAB_ID },
@@ -610,7 +610,7 @@ const TOOLS = [
   },
   {
     name: "screenshot",
-    description: "Take a PNG screenshot of the visible area of the tab.",
+    description: "Take a PNG screenshot of the tab. Uses CDP Page.captureScreenshot — works on background tabs WITHOUT stealing focus from the user. No tab switching needed.",
     inputSchema: { type: "object", properties: { ...TAB_ID } },
   },
   {
@@ -650,7 +650,7 @@ const TOOLS = [
   },
   {
     name: "press_key",
-    description: "Press a key or key combination (e.g. 'Enter', 'Escape', 'Tab', 'a'). Modifiers: ['Control','Shift','Alt','Meta'].",
+    description: "Press a key via CDP Input.dispatchKeyEvent — produces isTrusted:true events that work with all frameworks. Falls back to DOM events if CDP unavailable. Modifiers: ['Control','Shift','Alt','Meta'].",
     inputSchema: {
       type: "object",
       properties: {
@@ -707,6 +707,11 @@ const TOOLS = [
   {
     name: "close_tab",
     description: "Close the specified tab (or the active/pinned tab).",
+    inputSchema: { type: "object", properties: { ...TAB_ID } },
+  },
+  {
+    name: "detach_debugger",
+    description: "Detach the Chrome debugger from the tab, removing the yellow 'debugging' bar. The debugger auto-attaches when needed and auto-releases after 30s of inactivity, so you rarely need this. Use it when the yellow bar is distracting or after finishing a session of CDP-heavy tools.",
     inputSchema: { type: "object", properties: { ...TAB_ID } },
   },
   {
