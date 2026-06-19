@@ -372,10 +372,10 @@ async function applyMarker(tabId, show) {
   } catch {}
 }
 
-async function setMarker(tabId) {
+async function setMarker(tabId, skipGroup) {
   if (markedTabId === tabId) return;
   if (markedTabId !== null) {
-    applyMarker(markedTabId, false); // fire-and-forget for old tab
+    applyMarker(markedTabId, false);
     if (markerGrouped) {
       chrome.tabs.ungroup(markedTabId).catch(() => {});
       markerGrouped = false;
@@ -383,21 +383,25 @@ async function setMarker(tabId) {
   }
   markedTabId = tabId;
   if (tabId !== null) {
-    applyMarker(tabId, true); // fire-and-forget — don't block the tool call
-    try {
-      const t = await chrome.tabs.get(tabId);
-      if (t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
-        const gid = await chrome.tabs.group({ tabIds: tabId });
-        chrome.tabGroups.update(gid, { title: "\u{1F916} Claude", color: "orange" });
-        markerGrouped = true;
-      }
-    } catch {}
+    applyMarker(tabId, true);
+    // Only group the tab on explicit select_tab (not on every tool call)
+    if (!skipGroup) {
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
+          const gid = await chrome.tabs.group({ tabIds: tabId });
+          chrome.tabGroups.update(gid, { title: "\u{1F916} Claude", color: "orange" });
+          markerGrouped = true;
+        }
+      } catch {}
+    }
   }
 }
 
-// Deferred marker: call after response is already sent.
+// Deferred marker: silently marks the tab without grouping or stealing focus.
 function deferMarker(tabId) {
-  setTimeout(() => setMarker(tabId), 0);
+  if (markedTabId === tabId) return; // already marked, skip entirely
+  setTimeout(() => setMarker(tabId, true), 0); // skipGroup = true
 }
 
 // Re-apply marker + auto-inject recorder on page load.
@@ -1788,11 +1792,18 @@ async function handle(msg) {
 
     case "visual_diff": {
       // Compare two screenshots and highlight pixel differences.
-      if (!tab.active) { await chrome.tabs.update(tab.id, { active: true }); await new Promise(r => setTimeout(r, 200)); }
-      // F5 FIX: wait for paint before capturing "after" so injected CSS is rendered
       await execInTab(tab.id, () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 100))), [], "MAIN");
       if (markedTabId === tab.id) await applyMarker(tab.id, false);
-      const afterUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      let afterUrl;
+      try {
+        afterUrl = await withCDP(tab.id, async () => {
+          const { data } = await cdpSend(tab.id, "Page.captureScreenshot", { format: "png" });
+          return "data:image/png;base64," + data;
+        });
+      } catch {
+        if (!tab.active) { await chrome.tabs.update(tab.id, { active: true }); await new Promise(r => setTimeout(r, 200)); }
+        afterUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      }
       if (markedTabId === tab.id) applyMarker(tab.id, true);
       const diff = await execInTab(
         tab.id,
@@ -2364,18 +2375,20 @@ async function handle(msg) {
       const tab2 = params.tab_id_2;
       if (!tab1 || !tab2) throw new Error("Both tab_id_1 and tab_id_2 are required");
 
-      // Capture tab 1
-      await chrome.tabs.update(tab1, { active: true });
-      await new Promise(r => setTimeout(r, 400));
+      // Capture tab 1 via CDP (no focus stealing)
       if (markedTabId === tab1) await applyMarker(tab1, false);
-      const img1 = await chrome.tabs.captureVisibleTab((await chrome.tabs.get(tab1)).windowId, { format: "png" });
+      const img1 = await withCDP(tab1, async () => {
+        const { data } = await cdpSend(tab1, "Page.captureScreenshot", { format: "png" });
+        return "data:image/png;base64," + data;
+      });
       if (markedTabId === tab1) applyMarker(tab1, true);
 
-      // Capture tab 2
-      await chrome.tabs.update(tab2, { active: true });
-      await new Promise(r => setTimeout(r, 400));
+      // Capture tab 2 via CDP (no focus stealing)
       if (markedTabId === tab2) await applyMarker(tab2, false);
-      const img2 = await chrome.tabs.captureVisibleTab((await chrome.tabs.get(tab2)).windowId, { format: "png" });
+      const img2 = await withCDP(tab2, async () => {
+        const { data } = await cdpSend(tab2, "Page.captureScreenshot", { format: "png" });
+        return "data:image/png;base64," + data;
+      });
       if (markedTabId === tab2) applyMarker(tab2, true);
 
       // Compute diff
@@ -2615,13 +2628,18 @@ async function handle(msg) {
       );
       // Wait for frame to render
       await new Promise(r => setTimeout(r, 500));
-      // Take screenshot
-      if (!tab.active) {
-        await chrome.tabs.update(tab.id, { active: true });
-        await new Promise(r => setTimeout(r, 200));
-      }
+      // Take screenshot via CDP (no focus stealing)
       if (markedTabId === tab.id) await applyMarker(tab.id, false);
-      const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      let dataUrl;
+      try {
+        dataUrl = await withCDP(tab.id, async () => {
+          const { data } = await cdpSend(tab.id, "Page.captureScreenshot", { format: "png" });
+          return "data:image/png;base64," + data;
+        });
+      } catch {
+        if (!tab.active) { await chrome.tabs.update(tab.id, { active: true }); await new Promise(r => setTimeout(r, 200)); }
+        dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+      }
       if (markedTabId === tab.id) applyMarker(tab.id, true);
       // Get current caption at this timestamp
       const caption = await execInTab(
