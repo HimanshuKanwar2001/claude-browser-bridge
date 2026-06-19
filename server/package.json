@@ -1,7 +1,7 @@
 {
   "name": "claude-browser-bridge",
-  "version": "5.0.2",
-  "description": "Connect your live Chrome tabs to Claude Code — 65 tools for debugging, performance, accessibility, visual inspection, and browser automation.",
+  "version": "6.0.0",
+  "description": "Connect your live Chrome tabs to Claude Code — 75 tools for debugging, security testing, performance, accessibility, design validation, and browser automation. Self-contained knowledge system included.",
   "type": "module",
   "bin": {
     "claude-browser-bridge": "./bin/cli.js"
@@ -11,7 +11,8 @@
     "bin/",
     "index.js",
     "gen-token.js",
-    "README.md"
+    "README.md",
+    "extension/"
   ],
   "keywords": [
     "claude-code",

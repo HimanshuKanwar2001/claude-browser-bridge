@@ -1,6 +1,6 @@
 # claude-browser-bridge
 
-Connect your **real, logged-in Chrome tabs** to Claude Code for AI-assisted debugging with **57 tools** — DOM snapshots, console/network monitoring, performance tracing, CSS live-injection, visual diffs, device emulation, and more.
+Connect your **real, logged-in Chrome tabs** to Claude Code — **75 tools** for debugging, security testing, performance analysis, accessibility auditing, design validation, and browser automation. Includes a self-contained knowledge system that teaches Claude how to investigate any issue.
 
 ## Quick Start
 
@@ -8,16 +8,17 @@ Connect your **real, logged-in Chrome tabs** to Claude Code for AI-assisted debu
 # 1. Install globally (or use npx)
 npm install -g claude-browser-bridge
 
-# 2. Generate auth token
-claude-browser-bridge init
+# 2. Load the Chrome extension
+#    → chrome://extensions → Developer mode → Load unpacked
+#    → select the extension/ folder inside the installed package:
+#      $(npm root -g)/claude-browser-bridge/extension/
+#    Or clone from GitHub: https://github.com/HimanshuKanwar2001/claude-browser-bridge
 
-# 3. Load the Chrome extension
-#    → chrome://extensions → Developer mode → Load unpacked → select extension/ folder
-
-# 4. Register with Claude Code
+# 3. Register with Claude Code
 claude mcp add browser-bridge -- npx claude-browser-bridge
 
-# 5. Restart Claude Code and start debugging
+# 4. Restart Claude Code and start debugging
+#    Token is auto-generated (no init step needed)
 ```
 
 ## How It Works

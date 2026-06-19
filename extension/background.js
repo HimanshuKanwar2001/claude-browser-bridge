@@ -111,7 +111,7 @@ async function cdpAttach(tabId) {
     return true;
   } catch (e) {
     const msg = String(e?.message || e);
-    if (msg.includes("Already attached")) return true;
+    if (msg.includes("already attached") || msg.includes("Already attached") || msg.includes("Another debugger")) return true;
     if (msg.includes("Cannot attach") || msg.includes("Cannot access")) {
       throw new Error(
         `Cannot attach debugger to this tab. Chrome blocks debugger on chrome://, ` +
@@ -130,13 +130,16 @@ function releaseCDP(tabId) {
   session.attached = false;
 }
 
-async function withCDP(tabId, fn) {
+function withCDP(tabId, fn) {
   let session = cdpSessions.get(tabId);
   if (!session) {
     session = { attached: false, queue: Promise.resolve(), idleTimer: null, useCount: 0 };
     cdpSessions.set(tabId, session);
   }
-  const result = session.queue = session.queue.then(async () => {
+  // Chain on the current queue head THEN reassign — this ensures true serialization
+  // even when multiple withCDP calls happen synchronously (e.g. in batch Promise.all)
+  const prev = session.queue;
+  const next = prev.then(async () => {
     if (!session.attached) {
       await cdpAttach(tabId);
       session.attached = true;
@@ -149,7 +152,6 @@ async function withCDP(tabId, fn) {
       session.idleTimer = setTimeout(() => releaseCDP(tabId), CDP_IDLE_MS);
     }
   }).catch(async (err) => {
-    // If debugger was detached externally (user clicked cancel), clean up
     const msg = String(err?.message || err);
     if (msg.includes("Debugger is not attached") || msg.includes("Target closed")) {
       session.attached = false;
@@ -157,7 +159,8 @@ async function withCDP(tabId, fn) {
     }
     throw err;
   });
-  return result;
+  session.queue = next;
+  return next;
 }
 
 // Convenience: send a CDP command through the session

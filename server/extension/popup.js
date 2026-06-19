@@ -1,0 +1,2 @@
+/*! Claude Code Browser Bridge v1.0.0 | (c) 2026 Himanshu Kanwar | All rights reserved. Unauthorized copying, modification, or distribution is strictly prohibited. */
+chrome.runtime.sendMessage({type:"status"},t=>{const e=document.getElementById("dot"),n=document.getElementById("status-text"),s=document.getElementById("status");t?.connected?(e.className="dot on",n.textContent="Connected to Claude Code",s.className="status connected"):(e.className="dot off",n.textContent="Not connected — is Claude Code running?",s.className="status disconnected")});

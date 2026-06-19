@@ -1202,7 +1202,8 @@ const KNOWLEDGE_TOOL = {
     "'state_debugging' (storage, cache, session, React/Redux state), " +
     "'network_debugging' (CORS, caching, service workers, WebSocket), " +
     "'element_inspection' (DOM, CSS, layout, z-index, shadow DOM, iframes), " +
-    "'proactive_patterns' (automated sweeps to find problems before they're reported). " +
+    "'proactive_patterns' (automated sweeps to find problems before they're reported), " +
+    "'quick_reference' (decision trees, security checklist, anti-patterns — start here). " +
     "Call this when starting a new investigation to get the right approach.",
   inputSchema: {
     type: "object",
@@ -2231,7 +2232,57 @@ After sweep:
   - Compare screenshots across pages (consistent layout?)
   - Compare errors across pages (systemic issues?)
   - Compare styles on shared elements (inconsistent spacing/fonts?)
-\`\`\``
+\`\`\``,
+
+quick_reference: `# Quick Reference — What to Do for Any Problem
+
+## Decision Tree: Which approach for which problem?
+
+Visual bug? → batch([screenshot, get_styles({selector:".broken"})]) → inject_css fix → screenshot
+Broken feature? → diagnose (check consoleErrors + failedRequests) → click action → get_console + get_network
+Wrong data? → get_network({url_contains:"/api/"}) → search_network_bodies("value") → eval for state
+Security check? → get_cookies (flags) + get_network (tokens in URLs?) + get_html (reflected input?)
+Slow page? → performance_trace (Web Vitals) → get_load_timeline (waterfall)
+A11y audit? → get_accessibility_tree → check_contrast on key elements
+API failure? → diagnose (failedRequests) → get_network({only_failures:true}) → mock_network for testing
+Regression? → screenshot (save) → fix → visual_diff → record_actions/replay
+
+## Security Checklist (10 points)
+1. get_cookies → HttpOnly? Secure? SameSite? reasonable expiration?
+2. get_network → tokens/keys in URLs? (never put secrets in URLs)
+3. search_network_bodies("token") → where do tokens appear?
+4. fill XSS payload → get_html → reflected unescaped?
+5. get_html → hidden fields, HTML comments, JSON data with secrets?
+6. get_network → any http:// on https:// page? (mixed content)
+7. diagnose → cspBlocksEval false = weaker XSS protection
+8. get_storage → tokens in localStorage? (XSS can steal them)
+9. get_cookies → session cookie without Secure flag?
+10. get_network → Access-Control-Allow-Origin: * with credentials?
+
+## Chrome Edge Cases (handled automatically)
+- eval on CSP-strict sites (GitHub/YouTube): Uses CDP Runtime.evaluate, bypasses CSP
+- Debugger conflicts in batch: CDP session manager queues operations automatically
+- Screenshots: CDP Page.captureScreenshot works on background tabs, no focus stealing
+- React portals/Shadow DOM: Snapshot scans portal containers + walks shadow roots
+- Post-click staleness: MutationObserver waits for DOM to stabilize after click
+- Keyboard events: CDP Input.dispatchKeyEvent produces isTrusted:true events
+- wait_for: MutationObserver for instant detection (0ms if already present)
+- chrome:// pages: Detected early with clear error message
+- Transparent backgrounds: check_contrast walks up parent chain
+
+## Anti-Patterns (don't do these)
+- Don't retry eval on CSP error — it now auto-falls back to CDP
+- Don't call tools one at a time — use batch for independent calls
+- Don't guess CSS values — use get_styles to read actual computed values
+- Don't navigate app tab for research — use new_tab + close_tab
+- Don't claim fix works without screenshot verification
+- Don't batch is fine now — CDP session manager handles all queuing
+
+## How to Start Any Investigation
+1. Call bridge_knowledge("full_site_audit") for the complete methodology
+2. Or call diagnose as the single first step (covers 80% of needs)
+3. Then use bridge_knowledge with specific topic for deep dives
+`
 };
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [HELP_TOOL, KNOWLEDGE_TOOL, OBSERVE_TOOL, CURSOR_TOOL, BATCH_TOOL, ...TOOLS] }));
