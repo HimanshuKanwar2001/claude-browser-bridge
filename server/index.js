@@ -1203,7 +1203,8 @@ const KNOWLEDGE_TOOL = {
     "'network_debugging' (CORS, caching, service workers, WebSocket), " +
     "'element_inspection' (DOM, CSS, layout, z-index, shadow DOM, iframes), " +
     "'proactive_patterns' (automated sweeps to find problems before they're reported), " +
-    "'quick_reference' (decision trees, security checklist, anti-patterns — start here). " +
+    "'quick_reference' (decision trees, security checklist, anti-patterns — start here), " +
+    "'devtools_workarounds' (how to replicate Chrome DevTools panel features using bridge tools — CSS rules, event listeners, WebSocket, memory leaks, service workers, coverage). " +
     "Call this when starting a new investigation to get the right approach.",
   inputSchema: {
     type: "object",
@@ -2282,6 +2283,296 @@ Regression? → screenshot (save) → fix → visual_diff → record_actions/rep
 1. Call bridge_knowledge("full_site_audit") for the complete methodology
 2. Or call diagnose as the single first step (covers 80% of needs)
 3. Then use bridge_knowledge with specific topic for deep dives
+`,
+
+devtools_workarounds: `# Chrome DevTools Feature Workarounds
+
+When you need a DevTools feature the bridge doesn't have a dedicated tool for,
+use these workarounds with existing tools.
+
+## CSS Debugging (Elements Panel equivalent)
+
+### Which CSS rule applies to an element?
+DevTools: Elements → Styles pane shows matched rules with specificity
+Bridge workaround:
+\`\`\`
+get_styles({selector:".target"}) → shows COMPUTED values (what's actually applied)
+get_html({selector:".target"}) → shows classes/inline styles
+eval: getComputedStyle(el).cssText → full computed CSS
+eval: el.classList.toString() → all CSS classes
+\`\`\`
+
+### What event listeners are on an element?
+DevTools: Elements → Event Listeners tab
+Bridge workaround:
+\`\`\`
+eval: (() => {
+  const el = document.querySelector('.target');
+  const listeners = getEventListeners?.(el); // only works in DevTools console
+  // Alternative: check for known handlers
+  return JSON.stringify({
+    onclick: !!el.onclick,
+    hasClickAttr: el.hasAttribute('onclick'),
+    dataHandlers: [...el.attributes].filter(a => a.name.startsWith('data-') || a.name.startsWith('on'))
+      .map(a => a.name + '=' + a.value.slice(0,50))
+  });
+})()
+\`\`\`
+
+### Force :hover/:focus/:active state?
+DevTools: Elements → :hov toggle
+Bridge: hover({ref:"ref_X"}) for :hover
+For :focus: click({ref:"ref_X"}) then eval: document.activeElement.tagName
+
+### Track CSS changes made during session?
+DevTools: Changes panel
+Bridge: Use visual_diff — screenshot before → make changes → visual_diff shows what changed
+
+## Network Debugging (Network Panel equivalent)
+
+### See response body of successful requests?
+DevTools: Network → click request → Response tab
+Bridge workaround:
+\`\`\`
+get_network → shows response bodies for FAILURES only
+search_network_bodies({query:"keyword"}) → search ALL response bodies
+eval: fetch('/api/endpoint').then(r=>r.text()).then(t=>t.slice(0,2000)) → re-fetch the endpoint
+\`\`\`
+
+### See WebSocket frames?
+DevTools: Network → WS filter → click connection → Messages tab
+Bridge workaround:
+\`\`\`
+eval: (() => {
+  // Detect WS connections
+  const entries = performance.getEntriesByType('resource')
+    .filter(r => r.name.startsWith('wss://') || r.name.startsWith('ws://'));
+  return JSON.stringify(entries.map(r => ({url: r.name, duration: r.duration})));
+})()
+// For WS message content: watch DOM changes that result from WS messages
+watch_dom_changes({duration_ms: 5000}) → see what WS data updates in the UI
+\`\`\`
+
+### See request initiator chain?
+DevTools: Network → click request → Initiator tab
+Bridge: get_console → stack traces show what code made the call
+
+### Block specific URLs?
+DevTools: Network → right-click → Block request URL
+Bridge: mock_network({url_pattern: "/blocked-resource", status_code: 404})
+
+## Performance Debugging (Performance Panel equivalent)
+
+### CPU profiling / find slow functions?
+DevTools: Performance panel → Record → CPU flame chart
+Bridge workaround:
+\`\`\`
+eval: (() => {
+  const start = performance.now();
+  // Measure specific operations
+  return JSON.stringify(performance.getEntriesByType('measure')
+    .map(m => ({name: m.name, duration: Math.round(m.duration)})));
+})()
+// Or use performance marks around suspect code
+eval: performance.mark('start-suspect')
+// ... trigger the slow action
+eval: performance.measure('suspect-op', 'start-suspect')
+\`\`\`
+
+### Paint flashing / see what repaints?
+DevTools: Rendering → Paint flashing
+Bridge workaround:
+\`\`\`
+// Take screenshots at short intervals and visual_diff them
+screenshot → save → wait 1s → visual_diff → red areas = repaints
+
+// Or check for expensive layout properties
+eval: (() => {
+  const expensive = [];
+  document.querySelectorAll('*').forEach(el => {
+    const cs = getComputedStyle(el);
+    if (cs.position === 'fixed' || cs.position === 'sticky') expensive.push(el.tagName + '.' + el.className.split(' ')[0]);
+    if (cs.willChange && cs.willChange !== 'auto') expensive.push(el.tagName + ' will-change:' + cs.willChange);
+  });
+  return JSON.stringify(expensive);
+})()
+\`\`\`
+
+### INP (Interaction to Next Paint)?
+DevTools: Performance → check INP in Web Vitals lane
+Bridge workaround:
+\`\`\`
+eval: (() => {
+  return new Promise(resolve => {
+    new PerformanceObserver(list => {
+      const entries = list.getEntries();
+      resolve(JSON.stringify(entries.map(e => ({
+        name: e.name, duration: Math.round(e.duration),
+        processingStart: Math.round(e.processingStart),
+        processingEnd: Math.round(e.processingEnd)
+      }))));
+    }).observe({type: 'event', durationThreshold: 16, buffered: true});
+  });
+})()
+\`\`\`
+
+## Memory Debugging (Memory Panel equivalent)
+
+### Detect memory leaks?
+DevTools: Memory → Heap snapshot → compare two snapshots
+Bridge workaround:
+\`\`\`
+// Take measurements over time
+heap_snapshot_summary → record usedMB, nodeCount
+// Interact with the page (open/close dialogs, navigate)
+heap_snapshot_summary → compare
+// Repeat 5 times — if usedMB or nodeCount keeps growing → LEAK
+
+// Detect detached DOM nodes
+eval: (() => {
+  const nodeCount = document.querySelectorAll('*').length;
+  // After interaction that should clean up:
+  return 'DOM nodes: ' + nodeCount;
+})()
+// If count grows after opening/closing the same dialog → detached nodes leaking
+\`\`\`
+
+### Force garbage collection?
+DevTools: Performance panel → trash can icon
+Bridge: eval: window.gc?.() (only works with --js-flags="--expose-gc")
+Alternative: Navigate away and back — forces GC
+
+## Application Panel Equivalents
+
+### Inspect IndexedDB?
+DevTools: Application → IndexedDB
+Bridge:
+\`\`\`
+eval: (() => {
+  return new Promise(resolve => {
+    indexedDB.databases().then(dbs =>
+      resolve(JSON.stringify(dbs.map(d => ({name: d.name, version: d.version}))))
+    );
+  });
+})()
+\`\`\`
+
+### Inspect Cache Storage?
+DevTools: Application → Cache Storage
+Bridge:
+\`\`\`
+eval: (() => {
+  return new Promise(resolve => {
+    caches.keys().then(async keys => {
+      const result = {};
+      for (const key of keys) {
+        const cache = await caches.open(key);
+        const requests = await cache.keys();
+        result[key] = requests.map(r => r.url).slice(0, 20);
+      }
+      resolve(JSON.stringify(result, null, 2));
+    });
+  });
+})()
+\`\`\`
+
+### Service Worker status?
+DevTools: Application → Service Workers
+Bridge:
+\`\`\`
+eval: (() => {
+  return new Promise(resolve => {
+    navigator.serviceWorker?.getRegistrations().then(regs =>
+      resolve(JSON.stringify(regs.map(r => ({
+        scope: r.scope,
+        active: r.active?.state,
+        waiting: r.waiting?.state,
+        installing: r.installing?.state,
+        scriptURL: r.active?.scriptURL
+      }))))
+    );
+  });
+})()
+\`\`\`
+
+### Unregister a Service Worker?
+Bridge:
+\`\`\`
+eval: (() => {
+  return new Promise(resolve => {
+    navigator.serviceWorker?.getRegistrations().then(async regs => {
+      for (const r of regs) await r.unregister();
+      resolve('Unregistered ' + regs.length + ' service workers');
+    });
+  });
+})()
+\`\`\`
+
+## Rendering Panel Equivalents
+
+### Test print layout?
+DevTools: Rendering → Emulate CSS media → print
+Bridge: eval: document.body.classList.add('print-preview') — if the site has print CSS
+Alternative: export_pdf → see how the page renders for print
+
+### Test reduced motion?
+DevTools: Rendering → prefers-reduced-motion
+Bridge:
+\`\`\`
+eval: (() => {
+  const style = document.createElement('style');
+  style.textContent = '*, *::before, *::after { animation-duration: 0s !important; transition-duration: 0s !important; }';
+  document.head.appendChild(style);
+  return 'Animations disabled';
+})()
+\`\`\`
+
+### Find unused CSS/JS (Coverage panel)?
+DevTools: Coverage panel
+Bridge workaround:
+\`\`\`
+eval: (() => {
+  const stylesheets = [...document.styleSheets];
+  let totalRules = 0, usedRules = 0;
+  for (const sheet of stylesheets) {
+    try {
+      for (const rule of sheet.cssRules) {
+        totalRules++;
+        if (rule.selectorText && document.querySelector(rule.selectorText)) usedRules++;
+      }
+    } catch(e) {} // cross-origin sheets
+  }
+  return JSON.stringify({totalCSSRules: totalRules, usedCSSRules: usedRules,
+    unusedPercent: Math.round((1 - usedRules/totalRules) * 100) + '%'});
+})()
+\`\`\`
+
+## Security Panel Equivalents
+
+### Check TLS certificate?
+DevTools: Security panel
+Bridge:
+\`\`\`
+eval: JSON.stringify({
+  protocol: location.protocol,
+  secure: isSecureContext,
+  // Can't access certificate details from JS — use get_network to check for mixed content
+})
+get_network → filter for http:// requests on https:// page (mixed content)
+get_cookies → check Secure flag on all cookies
+\`\`\`
+
+## Summary: What You Can't Workaround
+
+These DevTools features have NO bridge workaround and would need dedicated CDP implementation:
+1. Full heap snapshot with object retention graph — HeapProfiler.takeHeapSnapshot
+2. CPU flame chart profiling — Profiler.start/stop
+3. Paint/layout/composite rendering performance — Tracing domain
+4. CSS Grid/Flexbox overlay visualization — Overlay domain
+5. JS breakpoint debugging (step through code) — Debugger domain
+6. Real-time performance monitor graph — Performance.getMetrics on interval
+
+For these, tell the user to open Chrome DevTools directly (F12).
 `
 };
 
