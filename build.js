@@ -5,7 +5,7 @@ import { minify } from "terser";
 
 const SRC = "extension";
 const DIST = "dist";
-const COPYRIGHT = `/*! Claude Code Browser Bridge v1.0.0 | (c) 2026 Himanshu Kanwar | All rights reserved. Unauthorized copying, modification, or distribution is strictly prohibited. */\n`;
+const COPYRIGHT = `/*! Claude Code Browser Bridge v6.0.1 | (c) 2026 Himanshu Kanwar | All rights reserved. Unauthorized copying, modification, or distribution is strictly prohibited. */\n`;
 
 execSync(`rm -rf ${DIST}`);
 mkdirSync(DIST, { recursive: true });
@@ -48,7 +48,7 @@ for (const file of readdirSync(SRC)) {
   }
 }
 
-const zipName = "claude-browser-bridge-v1.0.0.zip";
+const zipName = "claude-browser-bridge-v6.0.1.zip";
 execSync(`cd ${DIST} && zip -r ../${zipName} . -x ".*"`, { stdio: "pipe" });
 const zipSize = readFileSync(zipName).length;
 console.log(`\nPackaged: ${zipName} (${Math.round(zipSize / 1024)} KB)`);
