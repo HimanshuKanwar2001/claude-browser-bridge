@@ -6,6 +6,20 @@
 
 ---
 
+## Release Notes
+
+### v6.0.1 (2026-06-23) — Bug Fix Release
+
+**Fixed**: Reload affecting all tabs instead of just target tab
+- Added strict validation: `typeof tab.id !== 'number'` check before reload
+- Added debug logging: Console logs show which tab is being reloaded
+- Enhanced response: Returns tab URL for verification
+- Better error messages: Clear error if tab resolution fails
+- **Files modified**: `extension/background.js:1267-1276`
+- **Testing**: See `RELOAD-FIX.md` and `test-reload.md`
+
+---
+
 ## Architecture
 
 ```
