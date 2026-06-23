@@ -1265,9 +1265,13 @@ async function handle(msg) {
     }
 
     case "reload": {
+      if (!tab || typeof tab.id !== 'number') {
+        throw new Error("reload: No valid tab resolved — cannot reload without a target tab ID");
+      }
+      console.log(`[bridge] reloading tab ${tab.id} (${tab.url}) — bypass_cache: ${Boolean(params.bypass_cache)}`);
       injectedTabs.delete(tab.id);
       await chrome.tabs.reload(tab.id, { bypassCache: Boolean(params.bypass_cache) });
-      return { tab_id: tab.id, action: "reload" };
+      return { tab_id: tab.id, action: "reload", url: tab.url };
     }
 
     case "close_tab": {

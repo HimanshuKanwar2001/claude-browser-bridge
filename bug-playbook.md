@@ -2,6 +2,15 @@
 
 Patterns from past debugging sessions. Read this BEFORE investigating new bugs — the answer may already be here.
 
+## Pattern: Reload affecting all tabs (FIXED)
+**Symptoms:** User reports that calling `reload` refreshes all tabs in Chrome instead of just the target tab.
+**Root cause:** Potential edge case where `tab.id` could be undefined or invalid, causing unpredictable Chrome behavior.
+**How we found it:** Code review of `chrome.tabs.reload(tab.id, {...})` call — if `tab.id` is falsy, Chrome might reload the wrong tab or all tabs.
+**Fix:** Added strict validation `typeof tab.id !== 'number'` before reload. Added debug logging to track which tab is being reloaded. Now returns tab URL in response for verification.
+**Testing:** Check extension service worker console (`chrome://extensions/` → "service worker") for logs like `[bridge] reloading tab 12345 (https://example.com)`.
+**Date:** 2026-06-23
+**Files:** extension/background.js:1267-1276
+
 ## Pattern: 404 on local dev server
 **Symptoms:** Page shows "Page Not Found", no API calls in network tab.
 **Root cause:** Wrong dev server — URL belongs to theme A but dev server is running theme B.
